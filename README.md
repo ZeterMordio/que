@@ -1,6 +1,6 @@
 # que
 
-CLI tool for syncing and downloading music from QueUp playlists to Apple Music.
+CLI tool for syncing and downloading music playlists (YouTube, QueUp) to Apple Music.
 
 ## Install
 
