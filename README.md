@@ -1,6 +1,6 @@
 # que
 
-CLI tool for syncing and downloading music playlists (YouTube, QueUp) to Apple Music.
+CLI tool for syncing and downloading YouTube music playlists to Apple Music.
 
 ## Install
 
@@ -24,7 +24,7 @@ que list --status downloaded|in_library|failed
 
 ### Typical workflow
 
-1. Open your QueUp playlist and click **Copy tracklist to clipboard**
+1. Copy the playlist URL to clipboard
 2. In your terminal, run: `que`
 3. Tracks already in your library are skipped. New tracks are downloaded and added to Apple Music.
 
