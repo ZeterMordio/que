@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "que"
+version = "0.1.0"
+description = "CLI tool for syncing and downloading music from QueUp playlists"
+requires-python = ">=3.11"
+dependencies = [
+    "rapidfuzz>=3.0",
+    "mutagen>=1.47",
+    "rich>=13.0",
+]
+
+[project.scripts]
+que = "que.main:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["que*"]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.9",
+    "pytest>=8.0",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.ruff.format]
+quote-style = "double"
