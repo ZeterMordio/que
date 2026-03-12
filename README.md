@@ -1,6 +1,6 @@
 # que
 
-An automated music manager. Download playlists and syncronize them across your music libraries with one click (Apple Music, Spotify, YouTube).
+An automated music manager. Download playlists and syncronize them across platforms (Apple Music, Spotify, YouTube) with one click.
 
 ## Install
 
