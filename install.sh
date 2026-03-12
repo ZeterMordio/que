@@ -21,7 +21,7 @@ if ! command -v yt-dlp &>/dev/null; then
 fi
 
 echo "==> Installing que..."
-uv tool install "$SCRIPT_DIR"
+uv tool install --reinstall "$SCRIPT_DIR"
 
 echo ""
 echo "✓ que installed successfully."

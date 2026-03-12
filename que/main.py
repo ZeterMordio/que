@@ -6,9 +6,12 @@ Usage
   que                      Read clipboard, sync playlist to Apple Music
   que <URL> [<URL> ...]    Process one or more URLs directly
   que --dry-run            Show what would be downloaded, without downloading
+  que --benchmark          Benchmark download throughput with throwaway staging
+  que --jobs 3             Download eligible tracks with 3 workers
   que --no-cache           Ignore the URL cache for this run
   que --playlist NAME      Add imported tracks to a named Apple Music playlist
   que list                 Show recent processing history
+  que runs                 Show recent run metrics
   que config               Show the active config
   que list --status downloaded|in_library|failed
 
@@ -30,11 +33,8 @@ from .cache import Cache, _NullCache
 from .clipboard import get_urls_from_clipboard, normalize_url, parse_urls
 from .config import load_config
 from .config_cli import cmd_config
-from .downloader import download_track
-from .importer import import_to_apple_music
-from .library import FuzzyLibraryChecker
-from .resolver import expand_playlist, is_playlist_url, resolve_metadata
-from .tagger import tag_file
+from .pipeline import process_urls
+from .resolver import expand_playlist, is_playlist_url
 
 console = Console()
 
@@ -50,147 +50,24 @@ def _status_color(status: str) -> str:
     }.get(status, "white")
 
 
-def _label(artist: str, title: str) -> str:
-    if artist:
-        return f"[bold]{artist}[/bold] – {title}"
-    return f"[bold]{title}[/bold]"
+def _format_bytes(value: int) -> str:
+    """Render bytes using a compact binary unit."""
+    units = ["B", "KiB", "MiB", "GiB", "TiB"]
+    size = float(value)
+    unit = units[0]
+    for unit in units:
+        if size < 1024 or unit == units[-1]:
+            break
+        size /= 1024
+    decimals = 0 if unit == "B" else 1
+    return f"{size:.{decimals}f} {unit}"
 
 
-# ── Core processing loop ──────────────────────────────────────────────────────
-
-def process_urls(
-    urls: list[str],
-    dry_run: bool,
-    config,
-    cache,
-    playlist_name: str | None = None,
-) -> None:
-    """Process URLs from metadata resolution through import."""
-    checker = FuzzyLibraryChecker(
-        library_paths=config.library_paths,
-        threshold=config.fuzzy_threshold,
-    )
-
-    # ── Warn early if library is unreachable or empty ────────────────────────
-    existing = [p for p in config.library_paths if p.exists()]
-    if not existing:
-        paths_str = "\n     ".join(str(p) for p in config.library_paths)
-        console.print(
-            f"[yellow]⚠  No library paths found. Checked:[/yellow]\n     {paths_str}\n"
-            f"   Add your music folder to [bold]~/.config/que/config.toml[/bold]:\n"
-            f"   [dim][[library]]\n   paths = [\"~/Music/your-folder\"][/dim]"
-        )
-    elif not checker._tracks:
-        paths_str = ", ".join(str(p) for p in existing)
-        console.print(
-            "[yellow]⚠  Library paths exist but no audio files found:[/yellow] "
-            f"[dim]{paths_str}[/dim]"
-        )
-    else:
-        source_label = f"via {checker._source}"
-        if checker._source == "filesystem":
-            source_label += f" ({', '.join(str(p) for p in existing)})"
-        console.print(
-            f"[dim]📚 Library: {len(checker._tracks)} tracks {source_label}[/dim]"
-        )
-
-    stats = {"downloaded": 0, "in_library": 0, "failed": 0, "cached": 0, "skipped": 0}
-
-    for i, url in enumerate(urls, 1):
-        console.print(f"\n[dim]({i}/{len(urls)})[/dim] [dim]{url}[/dim]")
-
-        # ── Cache hit ────────────────────────────────────────────────────────
-        cached = cache.get(url)
-        if cached:
-            console.print(
-                f"  ⏭  [dim]Cached ({cached.status}):[/dim] "
-                f"{_label(cached.artist, cached.title)}"
-            )
-            stats["cached"] += 1
-            continue
-
-        # ── Resolve metadata ─────────────────────────────────────────────────
-        with console.status("  Fetching metadata…", spinner="dots"):
-            meta = resolve_metadata(url)
-
-        if not meta:
-            console.print("  [red]✗  Could not fetch metadata — skipping[/red]")
-            cache.set(url, "", "", "failed")
-            stats["failed"] += 1
-            continue
-
-        console.print(f"  🎵 {_label(meta.artist, meta.title)}")
-        if meta.raw_title != meta.title:
-            console.print(f"     [dim]raw: {meta.raw_title}[/dim]")
-
-        # ── Library check ────────────────────────────────────────────────────
-        result = checker.is_in_library(meta.artist, meta.title)
-
-        if result.in_library:
-            console.print(
-                f"  [cyan]✓  Already in library[/cyan]  "
-                f"[dim]{result.reason}[/dim]"
-            )
-            cache.set(url, meta.title, meta.artist, "in_library")
-            stats["in_library"] += 1
-            continue
-
-        console.print(
-            f"  [yellow]↓  Not in library[/yellow]  "
-            f"[dim]{result.reason}[/dim]"
-        )
-
-        if dry_run:
-            console.print("  [dim][dry-run] Would download[/dim]")
-            stats["skipped"] += 1
-            continue
-
-        # ── Download ─────────────────────────────────────────────────────────
-        with console.status("  Downloading…", spinner="dots"):
-            downloaded = download_track(url, config.staging_dir, config.audio_format)
-
-        if not downloaded:
-            console.print("  [red]✗  Download failed[/red]")
-            cache.set(url, meta.title, meta.artist, "failed")
-            stats["failed"] += 1
-            continue
-
-        console.print(f"  [green]✓  Downloaded:[/green] {downloaded.name}")
-
-        # ── Tag ──────────────────────────────────────────────────────────────
-        tagged = tag_file(downloaded, meta.artist, meta.title)
-        if tagged:
-            console.print("  🏷  Tagged with artist / title metadata")
-
-        # ── Import to Apple Music ────────────────────────────────────────────
-        ok, msg = import_to_apple_music(
-            downloaded,
-            meta.artist,
-            config.import_destination,
-            config.use_music_app,
-            playlist_name=playlist_name,
-        )
-
-        if ok:
-            console.print(f"  [green]✓  {msg}[/green]")
-            cache.set(url, meta.title, meta.artist, "downloaded")
-            stats["downloaded"] += 1
-        else:
-            console.print(f"  [red]✗  {msg}[/red]")
-            cache.set(url, meta.title, meta.artist, "failed")
-            stats["failed"] += 1
-
-    # ── Summary ──────────────────────────────────────────────────────────────
-    console.print()
-    console.rule("[bold]Summary[/bold]")
-    console.print(
-        f"  [green]{stats['downloaded']} downloaded & imported[/green]   "
-        f"[cyan]{stats['in_library']} already in library[/cyan]   "
-        f"[dim]{stats['cached']} cached (skipped)[/dim]   "
-        f"[yellow]{stats['skipped']} dry-run skipped[/yellow]   "
-        f"[red]{stats['failed']} failed[/red]"
-    )
-    console.print()
+def _format_rate(value: float | None) -> str:
+    """Render a bytes/sec rate for recent run output."""
+    if value is None:
+        return "—"
+    return f"{_format_bytes(int(value))}/s"
 
 
 # ── `que list` subcommand ─────────────────────────────────────────────────────
@@ -221,11 +98,65 @@ def cmd_list(cache: Cache, status_filter: str | None) -> None:
     console.print(table)
 
 
+def cmd_runs(cache: Cache, limit: int) -> None:
+    """Print recent aggregate run metrics from cache."""
+    rows = cache.recent_runs(limit=limit)
+
+    if not rows:
+        console.print("[dim]No run metrics found.[/dim]")
+        return
+
+    table = Table(title="que runs", show_lines=False, highlight=True)
+    table.add_column("Run", style="bold")
+    table.add_column("Mode", no_wrap=True)
+    table.add_column("Date", style="dim", no_wrap=True)
+    table.add_column("Jobs", justify="right")
+    table.add_column("URLs", justify="right")
+    table.add_column("Downloaded", justify="right", no_wrap=True)
+    table.add_column("Failed", justify="right", no_wrap=True)
+    table.add_column("Time", justify="right")
+    table.add_column("Avg rate", justify="right", no_wrap=True)
+
+    for row in rows:
+        failed = str(row.failed_count)
+        if row.download_failed_count or row.import_failed_count:
+            failed = (
+                f"{row.failed_count} "
+                f"[dim](d:{row.download_failed_count}/i:{row.import_failed_count})[/dim]"
+            )
+        downloaded = str(row.downloaded_count)
+        if row.downloaded_bytes:
+            downloaded = (
+                f"{row.downloaded_count} "
+                f"[dim]({_format_bytes(row.downloaded_bytes)})[/dim]"
+            )
+        total = "—" if row.total_seconds is None else f"{row.total_seconds:.2f}s"
+        table.add_row(
+            str(row.run_id),
+            row.run_mode,
+            row.started_at.strftime("%Y-%m-%d %H:%M"),
+            str(row.jobs),
+            str(row.total_urls),
+            downloaded,
+            failed,
+            total,
+            _format_rate(row.average_download_bytes_per_second),
+        )
+
+    console.print(table)
+
+
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 def main() -> None:
     """Run the que CLI."""
     import argparse
+
+    def positive_int(value: str) -> int:
+        parsed = int(value)
+        if parsed < 1:
+            raise argparse.ArgumentTypeError("--jobs must be >= 1")
+        return parsed
 
     # ── Handle `que list [--status ...]` before normal parsing ───────────────
     # This avoids argparse confusing URLs with subcommand names when both
@@ -250,6 +181,24 @@ def main() -> None:
     if len(sys.argv) > 1 and sys.argv[1] == "config":
         raise SystemExit(cmd_config(sys.argv[2:]))
 
+    if len(sys.argv) > 1 and sys.argv[1] == "runs":
+        runs_parser = argparse.ArgumentParser(prog="que runs")
+        runs_parser.add_argument(
+            "--limit",
+            type=int,
+            default=20,
+            metavar="N",
+            help="How many recent runs to show. (default: 20)",
+        )
+        runs_args = runs_parser.parse_args(sys.argv[2:])
+        config = load_config()
+        cache = Cache(config.cache_path)
+        try:
+            cmd_runs(cache, runs_args.limit)
+        finally:
+            cache.close()
+        return
+
     # ── Normal sync / download flow ───────────────────────────────────────────
     parser = argparse.ArgumentParser(
         prog="que",
@@ -257,7 +206,9 @@ def main() -> None:
             "Sync and download music from QueUp playlists to Apple Music.\n\n"
             "  que                  Read clipboard and sync\n"
             "  que <URL> [<URL>...] Process URLs directly\n"
+            "  que --benchmark      Benchmark download-engine throughput\n"
             "  que list             Show processing history\n"
+            "  que runs             Show run metrics\n"
             "  que config           View or edit config\n"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -274,6 +225,15 @@ def main() -> None:
         "--dry-run",
         action="store_true",
         help="Show what would be downloaded without actually downloading.",
+    )
+    parser.add_argument(
+        "--benchmark",
+        action="store_true",
+        help=(
+            "Benchmark the download engine only: skip metadata, cache/library "
+            "checks, tagging, and Apple Music import; clean up throwaway "
+            "staging files after each track."
+        ),
     )
     parser.add_argument(
         "--no-cache",
@@ -294,8 +254,19 @@ def main() -> None:
         metavar="NAME",
         help="Add imported tracks to the named Apple Music playlist.",
     )
+    parser.add_argument(
+        "--jobs",
+        type=positive_int,
+        default=3,
+        metavar="N",
+        help="Number of parallel download workers to use. (default: 3)",
+    )
 
     args = parser.parse_args()
+    if args.benchmark and args.dry_run:
+        parser.error("--benchmark cannot be combined with --dry-run")
+    if args.benchmark and args.playlist:
+        parser.error("--benchmark cannot be combined with --playlist")
 
     # ── Load config & cache ──────────────────────────────────────────────────
     config = load_config()
@@ -310,7 +281,11 @@ def main() -> None:
             "enabling it for this run.[/yellow]"
         )
 
-    cache = _NullCache() if args.no_cache else Cache(config.cache_path)  # type: ignore[assignment]
+    cache = (
+        Cache(config.cache_path)
+        if args.benchmark or not args.no_cache
+        else _NullCache()
+    )
 
     try:
         # ── Collect URLs ─────────────────────────────────────────────────────
@@ -355,6 +330,9 @@ def main() -> None:
             config=config,
             cache=cache,
             playlist_name=args.playlist,
+            jobs=args.jobs,
+            benchmark=args.benchmark,
+            console=console,
         )
 
     finally:
