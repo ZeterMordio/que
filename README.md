@@ -1,6 +1,6 @@
 # que
 
-CLI tool for syncing and downloading YouTube music playlists to Apple Music.
+An automated music manager. Download playlists and syncronize them across your music libraries with one click (Apple Music, Spotify, YouTube).
 
 ## Install
 
@@ -93,9 +93,4 @@ No other changes needed.
 
 ## Roadmap
 
-- [ ] `que room` — pull the current QueUp room queue directly
-- [ ] `que config` — view/edit config from the terminal
-- [ ] Parallel downloads
-- [ ] Spotify support via `spotdl`
-- [ ] AI-powered library matching (semantic embeddings)
-- [ ] `--playlist` flag to add downloaded tracks to a named Apple Music playlist
+The phased contributor roadmap now lives in [ROADMAP.md](ROADMAP.md). It covers the planned order for CLI improvements, parallel downloads, shared local service work, quick-access clients, source expansion, and a separate intelligent library search feature.
