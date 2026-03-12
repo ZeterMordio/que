@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Reworked the README into a user-facing landing page and added tracked root-level `DEVELOPMENT.md` and `ARCHITECTURE.md` docs for developer and agent-facing detail.
 - Added Phase 2 parallel downloads with `--jobs`, sequential preflight, and serialized tag/import/cache commits.
 - Added concurrency regression tests for ordered results, staging isolation, and main-thread cache writes.
 - Added run-level and per-track performance metrics in the SQLite cache DB, plus `que runs` for quick inspection.
