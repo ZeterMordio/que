@@ -8,19 +8,9 @@ Follows the XDG Base Directory Specification:
 from __future__ import annotations
 
 import os
-import sys
+import tomllib
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List
-
-# tomllib is stdlib in Python 3.11+
-if sys.version_info >= (3, 11):
-    import tomllib
-else:
-    try:
-        import tomli as tomllib  # pip install tomli
-    except ImportError:
-        tomllib = None  # type: ignore
 
 
 def _xdg_config_home() -> Path:
@@ -57,7 +47,7 @@ _DEFAULTS = {
     },
     "import": {
         "use_music_app": True,
-        "fallback_to_folder": True,
+        "mode": "move_then_music",
         # Where to move downloaded files (first existing library path is used)
         "destination": "~/Music/Music/Media.localized/Music",
     },
@@ -69,25 +59,110 @@ _DEFAULTS = {
 
 @dataclass
 class Config:
-    library_paths: List[Path]
+    """Runtime configuration for que."""
+
+    library_paths: list[Path]
     fuzzy_threshold: int
     staging_dir: Path
     audio_format: str
     use_music_app: bool
-    fallback_to_folder: bool
+    import_mode: str
     import_destination: Path
     cache_path: Path
 
 
-def load_config() -> Config:
-    raw: dict = {}
+def _display_path(path: Path) -> str:
+    """Return a user-friendly path string, preferring `~` for home-relative paths."""
+    home = Path.home()
+    try:
+        relative = path.relative_to(home)
+    except ValueError:
+        return str(path)
+    return "~" if not relative.parts else f"~/{relative.as_posix()}"
 
-    if CONFIG_PATH.exists():
-        if tomllib is None:
-            raise RuntimeError(
-                "tomllib not available. On Python <3.11, run: pip install tomli"
-            )
-        with open(CONFIG_PATH, "rb") as f:
+
+def render_config(config: Config) -> str:
+    """Return a config object rendered as TOML."""
+    library_paths = "\n".join(
+        f'  "{_display_path(path)}",'
+        for path in config.library_paths
+    )
+    return f"""# que config
+# Created and edited via `que config`
+
+[library]
+paths = [
+{library_paths}
+]
+fuzzy_threshold = {config.fuzzy_threshold}
+
+[download]
+staging_dir = "{_display_path(config.staging_dir)}"
+format = "{config.audio_format}"
+
+[import]
+use_music_app = {str(config.use_music_app).lower()}
+mode = "{config.import_mode}"
+destination = "{_display_path(config.import_destination)}"
+
+[cache]
+path = "{_display_path(config.cache_path)}"
+"""
+
+
+def default_config() -> Config:
+    """Return the default runtime config."""
+    return Config(
+        library_paths=[Path(path).expanduser() for path in _DEFAULT_LIBRARY_PATHS],
+        fuzzy_threshold=_DEFAULTS["library"]["fuzzy_threshold"],
+        staging_dir=Path(_DEFAULTS["download"]["staging_dir"]).expanduser(),
+        audio_format=_DEFAULTS["download"]["format"],
+        use_music_app=_DEFAULTS["import"]["use_music_app"],
+        import_mode=_DEFAULTS["import"]["mode"],
+        import_destination=Path(_DEFAULTS["import"]["destination"]).expanduser(),
+        cache_path=Path(_DEFAULTS["cache"]["path"]).expanduser(),
+    )
+
+
+def render_default_config() -> str:
+    """Return the default user config template as TOML."""
+    return render_config(default_config())
+
+
+def ensure_config_file(config_path: Path | None = None) -> Path:
+    """Create the config file with defaults if it does not exist."""
+    target_path = config_path or CONFIG_PATH
+    if target_path.exists():
+        return target_path
+
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    target_path.write_text(render_default_config(), encoding="utf-8")
+    return target_path
+
+
+def read_config_text(config_path: Path | None = None) -> str:
+    """Return the raw config text, or the default template if missing."""
+    target_path = config_path or CONFIG_PATH
+    if target_path.exists():
+        return target_path.read_text(encoding="utf-8")
+    return render_default_config()
+
+
+def write_config(config: Config, config_path: Path | None = None) -> Path:
+    """Write the given config object to disk as TOML."""
+    target_path = config_path or CONFIG_PATH
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    target_path.write_text(render_config(config), encoding="utf-8")
+    return target_path
+
+
+def load_config(config_path: Path | None = None) -> Config:
+    """Load the effective config, applying defaults for missing keys."""
+    raw: dict = {}
+    target_path = config_path or CONFIG_PATH
+
+    if target_path.exists():
+        with open(target_path, "rb") as f:
             raw = tomllib.load(f)
 
     lib = raw.get("library", {})
@@ -104,14 +179,30 @@ def load_config() -> Config:
         raw_paths = _DEFAULT_LIBRARY_PATHS
 
     library_paths = [Path(p).expanduser() for p in raw_paths]
+    import_mode = imp.get("mode")
+    if import_mode is None:
+        # Reason: legacy configs used `fallback_to_folder`; the only supported
+        # path now is the old folder-first strategy, so we normalize to it.
+        import_mode = _DEFAULTS["import"]["mode"]
+
+    if import_mode != "move_then_music":
+        raise ValueError(
+            "Unsupported import.mode. Supported values: move_then_music"
+        )
 
     return Config(
         library_paths=library_paths,
-        fuzzy_threshold=int(lib.get("fuzzy_threshold", _DEFAULTS["library"]["fuzzy_threshold"])),
+        fuzzy_threshold=int(
+            lib.get("fuzzy_threshold", _DEFAULTS["library"]["fuzzy_threshold"])
+        ),
         staging_dir=Path(dl.get("staging_dir", _DEFAULTS["download"]["staging_dir"])).expanduser(),
         audio_format=dl.get("format", _DEFAULTS["download"]["format"]),
-        use_music_app=bool(imp.get("use_music_app", _DEFAULTS["import"]["use_music_app"])),
-        fallback_to_folder=bool(imp.get("fallback_to_folder", _DEFAULTS["import"]["fallback_to_folder"])),
-        import_destination=Path(imp.get("destination", _DEFAULTS["import"]["destination"])).expanduser(),
+        use_music_app=bool(
+            imp.get("use_music_app", _DEFAULTS["import"]["use_music_app"])
+        ),
+        import_mode=import_mode,
+        import_destination=Path(
+            imp.get("destination", _DEFAULTS["import"]["destination"])
+        ).expanduser(),
         cache_path=Path(cache.get("path", _DEFAULTS["cache"]["path"])).expanduser(),
     )

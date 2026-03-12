@@ -10,6 +10,12 @@ chmod +x install.sh && ./install.sh
 
 Requires Python 3.11+ and Homebrew (for yt-dlp). The install script handles everything.
 
+For development:
+
+```bash
+uv run pytest
+```
+
 ## Usage
 
 ```
@@ -18,8 +24,12 @@ que <URL> [<URL> ...]    # process one or more URLs directly
 que --dry-run            # preview what would be downloaded (no downloads)
 que --no-cache           # re-check every URL even if previously processed
 que --threshold 75       # override fuzzy-match threshold for this run
+que --playlist "Road Trip"  # add imported tracks to an Apple Music playlist
 que list                 # show recent processing history
 que list --status downloaded|in_library|failed
+que config               # show config + optional helper wizard
+que config --no-wizard   # show config without entering the wizard
+que config edit          # create/edit config in $EDITOR / $VISUAL
 ```
 
 ### Typical workflow
@@ -30,11 +40,17 @@ que list --status downloaded|in_library|failed
 
 ## Config
 
-`que` works out of the box with no config needed. To customise, create `~/.querc`:
+`que` works out of the box with no config needed. The config file lives at
+`~/.config/que/config.toml` by default. You can view it with `que config`,
+create it with `que config init`, edit it with `que config edit`, and use the
+built-in helper wizard from `que config` in an interactive terminal.
 
 ```toml
 [library]
-path = "~/Music/iTunes/iTunes Media/Apple Music"
+paths = [
+  "~/Music/Music/Media.localized",
+  "~/Music/iTunes/iTunes Media",
+]
 # Minimum confidence (0–100) to consider a track as "already in library".
 # Higher = stricter matching = more downloads. Default: 85.
 fuzzy_threshold = 85
@@ -45,10 +61,11 @@ format = "m4a"
 
 [import]
 use_music_app = true        # notify Music.app via AppleScript
-fallback_to_folder = true   # always move file to library folder first
+mode = "move_then_music"    # current supported import strategy
+destination = "~/Music/Music/Media.localized/Music"
 
 [cache]
-path = "~/.que/cache.db"
+path = "~/.local/share/que/cache.db"
 ```
 
 ## Architecture
@@ -56,8 +73,9 @@ path = "~/.que/cache.db"
 ```
 que/
 ├── main.py        CLI entry point, processing loop
-├── config.py      ~/.querc loader
-├── cache.py       SQLite URL cache (~/.que/cache.db)
+├── config.py      XDG config loader (~/.config/que/config.toml)
+├── config_cli.py  `que config` workflow
+├── cache.py       SQLite URL cache (~/.local/share/que/cache.db)
 ├── clipboard.py   macOS clipboard reader + URL parser
 ├── resolver.py    yt-dlp metadata fetching (no download)
 ├── library.py     LibraryChecker Protocol + FuzzyLibraryChecker

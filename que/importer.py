@@ -19,7 +19,6 @@ import re
 import shutil
 import subprocess
 from pathlib import Path
-from typing import Optional
 
 _UNSAFE_RE = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 
@@ -29,13 +28,38 @@ def _safe_name(s: str) -> str:
     return _UNSAFE_RE.sub("_", s).strip(" .")
 
 
-def _osascript_add(file_path: Path) -> bool:
+def _escape_applescript_string(value: str) -> str:
+    """Escape a string for safe inclusion inside AppleScript string literals."""
+    return value.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def _osascript_add(file_path: Path, playlist_name: str | None = None) -> bool:
     """
     Tell Music.app to add a file via AppleScript.
     Returns True on success, False on any error.
     """
-    posix = str(file_path.resolve()).replace("\\", "\\\\").replace('"', '\\"')
-    script = f'tell application "Music" to add POSIX file "{posix}"'
+    posix = _escape_applescript_string(str(file_path.resolve()))
+    playlist = _escape_applescript_string(playlist_name or "")
+    script = f'''
+tell application "Music"
+    set addedItems to add POSIX file "{posix}"
+    if "{playlist}" is not "" then
+        if exists user playlist "{playlist}" then
+            set targetPlaylist to user playlist "{playlist}"
+        else
+            set targetPlaylist to make new user playlist with properties {{name:"{playlist}"}}
+        end if
+
+        if class of addedItems is list then
+            repeat with addedTrack in addedItems
+                duplicate addedTrack to targetPlaylist
+            end repeat
+        else
+            duplicate addedItems to targetPlaylist
+        end if
+    end if
+end tell
+'''.strip()
     try:
         result = subprocess.run(
             ["osascript", "-e", script],
@@ -53,44 +77,56 @@ def import_to_apple_music(
     artist: str,
     library_path: Path,
     use_music_app: bool = True,
-    fallback_to_folder: bool = True,
+    playlist_name: str | None = None,
 ) -> tuple[bool, str]:
     """
     Import a downloaded audio file into the Apple Music library.
 
     Returns (success: bool, message: str).
     """
-    dest_path: Optional[Path] = None
+    dest_path: Path | None = None
 
     # ── Step 1: move file into library folder ────────────────────────────────
-    if fallback_to_folder:
-        artist_dir = _safe_name(artist) if artist else "Unknown Artist"
-        dest_dir = library_path / artist_dir / "Unknown Album"
-        try:
-            dest_dir.mkdir(parents=True, exist_ok=True)
-            dest_path = dest_dir / file_path.name
-            # Avoid overwriting an existing file with the same name
-            if dest_path.exists():
-                stem = file_path.stem
-                suffix = file_path.suffix
-                counter = 1
-                while dest_path.exists():
-                    dest_path = dest_dir / f"{stem} ({counter}){suffix}"
-                    counter += 1
-            shutil.move(str(file_path), str(dest_path))
-        except Exception as e:
-            return False, f"Could not move file to library folder: {e}"
+    artist_dir = _safe_name(artist) if artist else "Unknown Artist"
+    dest_dir = library_path / artist_dir / "Unknown Album"
+    try:
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        dest_path = dest_dir / file_path.name
+        # Avoid overwriting an existing file with the same name
+        if dest_path.exists():
+            stem = file_path.stem
+            suffix = file_path.suffix
+            counter = 1
+            while dest_path.exists():
+                dest_path = dest_dir / f"{stem} ({counter}){suffix}"
+                counter += 1
+        shutil.move(str(file_path), str(dest_path))
+    except Exception as e:
+        return False, f"Could not move file to library folder: {e}"
 
     # ── Step 2: notify Music.app ─────────────────────────────────────────────
     if use_music_app and dest_path:
-        music_ok = _osascript_add(dest_path)
+        music_ok = _osascript_add(dest_path, playlist_name=playlist_name)
         if music_ok:
+            if playlist_name:
+                return True, (
+                    f'Imported via Music.app and added to "{playlist_name}"'
+                    f" -> {dest_path.name}"
+                )
             return True, f"Imported via Music.app → {dest_path.name}"
         else:
             # File is already in the right folder; Music.app notification failed
-            return True, f"In library folder (Music.app notification failed) → {dest_path.name}"
+            if playlist_name:
+                return True, (
+                    f'In library folder (Music.app playlist import failed for "{playlist_name}")'
+                    f" -> {dest_path.name}"
+                )
+            return True, f"In library folder (Music.app notification failed) -> {dest_path.name}"
 
-    if dest_path:
-        return True, f"Moved to library folder → {dest_path.name}"
-
-    return False, "Import failed: no destination path"
+    if playlist_name:
+        return True, (
+            f'Moved to library folder (playlist "{playlist_name}" '
+            "requires Music.app integration)"
+            f" -> {dest_path.name}"
+        )
+    return True, f"Moved to library folder → {dest_path.name}"

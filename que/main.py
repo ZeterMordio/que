@@ -7,7 +7,9 @@ Usage
   que <URL> [<URL> ...]    Process one or more URLs directly
   que --dry-run            Show what would be downloaded, without downloading
   que --no-cache           Ignore the URL cache for this run
+  que --playlist NAME      Add imported tracks to a named Apple Music playlist
   que list                 Show recent processing history
+  que config               Show the active config
   que list --status downloaded|in_library|failed
 
 Expansion roadmap (planned)
@@ -20,19 +22,18 @@ Expansion roadmap (planned)
 from __future__ import annotations
 
 import sys
-from pathlib import Path
-from typing import List, Optional
 
 from rich.console import Console
 from rich.table import Table
 
 from .cache import Cache, _NullCache
-from .clipboard import get_urls_from_clipboard, parse_urls, normalize_url
+from .clipboard import get_urls_from_clipboard, normalize_url, parse_urls
 from .config import load_config
+from .config_cli import cmd_config
 from .downloader import download_track
 from .importer import import_to_apple_music
 from .library import FuzzyLibraryChecker
-from .resolver import resolve_metadata, is_playlist_url, expand_playlist
+from .resolver import expand_playlist, is_playlist_url, resolve_metadata
 from .tagger import tag_file
 
 console = Console()
@@ -58,11 +59,13 @@ def _label(artist: str, title: str) -> str:
 # ── Core processing loop ──────────────────────────────────────────────────────
 
 def process_urls(
-    urls: List[str],
+    urls: list[str],
     dry_run: bool,
     config,
     cache,
+    playlist_name: str | None = None,
 ) -> None:
+    """Process URLs from metadata resolution through import."""
     checker = FuzzyLibraryChecker(
         library_paths=config.library_paths,
         threshold=config.fuzzy_threshold,
@@ -80,7 +83,8 @@ def process_urls(
     elif not checker._tracks:
         paths_str = ", ".join(str(p) for p in existing)
         console.print(
-            f"[yellow]⚠  Library paths exist but no audio files found:[/yellow] [dim]{paths_str}[/dim]"
+            "[yellow]⚠  Library paths exist but no audio files found:[/yellow] "
+            f"[dim]{paths_str}[/dim]"
         )
     else:
         source_label = f"via {checker._source}"
@@ -98,7 +102,6 @@ def process_urls(
         # ── Cache hit ────────────────────────────────────────────────────────
         cached = cache.get(url)
         if cached:
-            color = _status_color(cached.status)
             console.print(
                 f"  ⏭  [dim]Cached ({cached.status}):[/dim] "
                 f"{_label(cached.artist, cached.title)}"
@@ -165,7 +168,7 @@ def process_urls(
             meta.artist,
             config.import_destination,
             config.use_music_app,
-            config.fallback_to_folder,
+            playlist_name=playlist_name,
         )
 
         if ok:
@@ -192,7 +195,8 @@ def process_urls(
 
 # ── `que list` subcommand ─────────────────────────────────────────────────────
 
-def cmd_list(cache: Cache, status_filter: Optional[str]) -> None:
+def cmd_list(cache: Cache, status_filter: str | None) -> None:
+    """Print the recent processing history from cache."""
     rows = cache.recent(limit=50, status_filter=status_filter)
 
     if not rows:
@@ -205,7 +209,7 @@ def cmd_list(cache: Cache, status_filter: Optional[str]) -> None:
     table.add_column("Title")
     table.add_column("Date", style="dim", width=12)
 
-    for url, artist, title, status, ts in rows:
+    for _url, artist, title, status, ts in rows:
         color = _status_color(status)
         table.add_row(
             f"[{color}]{status}[/{color}]",
@@ -220,6 +224,7 @@ def cmd_list(cache: Cache, status_filter: Optional[str]) -> None:
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 def main() -> None:
+    """Run the que CLI."""
     import argparse
 
     # ── Handle `que list [--status ...]` before normal parsing ───────────────
@@ -242,6 +247,9 @@ def main() -> None:
             cache.close()
         return
 
+    if len(sys.argv) > 1 and sys.argv[1] == "config":
+        raise SystemExit(cmd_config(sys.argv[2:]))
+
     # ── Normal sync / download flow ───────────────────────────────────────────
     parser = argparse.ArgumentParser(
         prog="que",
@@ -250,6 +258,7 @@ def main() -> None:
             "  que                  Read clipboard and sync\n"
             "  que <URL> [<URL>...] Process URLs directly\n"
             "  que list             Show processing history\n"
+            "  que config           View or edit config\n"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -279,6 +288,12 @@ def main() -> None:
         help="Override the fuzzy-match threshold for this run. "
              "Lower = more downloads. (default: 85)",
     )
+    parser.add_argument(
+        "--playlist",
+        default=None,
+        metavar="NAME",
+        help="Add imported tracks to the named Apple Music playlist.",
+    )
 
     args = parser.parse_args()
 
@@ -287,13 +302,20 @@ def main() -> None:
 
     if args.threshold is not None:
         config.fuzzy_threshold = args.threshold
+    if args.playlist and not config.use_music_app:
+        # Reason: playlist assignment only works via Music.app scripting.
+        config.use_music_app = True
+        console.print(
+            "[yellow]Playlist import requires Music.app integration; "
+            "enabling it for this run.[/yellow]"
+        )
 
     cache = _NullCache() if args.no_cache else Cache(config.cache_path)  # type: ignore[assignment]
 
     try:
         # ── Collect URLs ─────────────────────────────────────────────────────
         if args.urls:
-            urls: List[str] = []
+            urls: list[str] = []
             for u in args.urls:
                 found = parse_urls(u)
                 urls.extend(found if found else [normalize_url(u)])
@@ -309,10 +331,10 @@ def main() -> None:
             sys.exit(0)
 
         # ── Expand any playlist URLs into individual track URLs ───────────────
-        expanded: List[str] = []
+        expanded: list[str] = []
         for url in urls:
             if is_playlist_url(url):
-                with console.status(f"  Expanding playlist…", spinner="dots"):
+                with console.status("  Expanding playlist…", spinner="dots"):
                     tracks = expand_playlist(url)
                 console.print(
                     f"  📋 Playlist expanded → [bold]{len(tracks)}[/bold] tracks"
@@ -327,7 +349,13 @@ def main() -> None:
             + (" [dim](dry-run)[/dim]" if args.dry_run else "")
         )
 
-        process_urls(urls, dry_run=args.dry_run, config=config, cache=cache)
+        process_urls(
+            urls,
+            dry_run=args.dry_run,
+            config=config,
+            cache=cache,
+            playlist_name=args.playlist,
+        )
 
     finally:
         cache.close()
