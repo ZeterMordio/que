@@ -1,78 +1,94 @@
 # que
 
-An automated music manager. Download playlists and syncronize them across platforms (Apple Music, Spotify, YouTube) with one click.
+`que` is a macOS CLI for bringing YouTube tracks and playlists into Apple Music without redownloading songs you already have.
+
+Copy a URL, run one command, and let `que` check your library, download only the missing tracks, tag them, and hand them off to Apple Music.
+
+## What It Does
+
+- Accepts a YouTube track or playlist URL from the clipboard or the command line
+- Checks your local library before downloading, so obvious duplicates are skipped
+- Downloads missing tracks, tags them, and imports them into Apple Music
+- Can add newly imported tracks to a named Apple Music playlist
+
+## Requirements
+
+- macOS
+- Apple Music
+- Python 3.11+
+- Homebrew recommended for the install flow
+
+Optional but useful:
+
+- Google Chrome, for occasional `yt-dlp` cookie fallback on harder-to-download videos
 
 ## Install
 
-```bash
-chmod +x install.sh && ./install.sh
-```
-
-Requires Python 3.11+ and Homebrew (for yt-dlp). The install script handles everything.
-
-For development:
+1. Clone this repository.
+2. Run the installer:
 
 ```bash
-uv run pytest
-uv run que --help
+chmod +x install.sh
+./install.sh
 ```
 
-While working in the repo, prefer `uv run que ...` so you execute the current source tree. Rerunning `./install.sh` now refreshes the globally installed `que` tool too.
-
-## Usage
-
-```
-que                      # read clipboard → sync to Apple Music
-que <URL> [<URL> ...]    # process one or more URLs directly
-que --dry-run            # preview what would be downloaded (no downloads)
-que --benchmark          # benchmark download-engine throughput only
-que --jobs 3             # download eligible tracks with 3 workers
-que --no-cache           # re-check every URL even if previously processed
-que --threshold 75       # override fuzzy-match threshold for this run
-que --playlist "Road Trip"  # add imported tracks to an Apple Music playlist
-que list                 # show recent processing history
-que runs                 # show recent run-level performance metrics
-que list --status downloaded|in_library|failed
-que config               # show config + optional helper wizard
-que config --no-wizard   # show config without entering the wizard
-que config edit          # create/edit config in $EDITOR / $VISUAL
-```
-
-### Typical workflow
-
-1. Copy the playlist URL to clipboard
-2. In your terminal, run: `que`
-3. Tracks already in your library are skipped. New tracks are downloaded and added to Apple Music.
-
-### Benchmarking the download engine
-
-Use benchmark mode when you want repeatable download-engine comparisons on the same URLs.
-This is intentionally not end-to-end sync benchmarking.
+3. If your music library lives somewhere unusual, run the config helper once:
 
 ```bash
-que --benchmark --jobs 1 <URL>
-que --benchmark --jobs 2 <URL>
-que --benchmark --jobs 3 <URL>
-que runs
+que config
 ```
 
-Benchmark mode intentionally:
+That is usually enough. The install script handles `uv` and `yt-dlp` for you.
 
-- skips metadata resolution
-- skips URL cache reads/writes
-- skips library checks
-- skips tagging
-- skips Apple Music import
-- downloads into throwaway staging directories and cleans them up after each track
+## Quickstart
 
-If you want end-to-end timings instead, run normal `que ...` and compare the resulting entries in `que runs`.
+1. Copy a YouTube track or playlist URL.
+2. Run:
 
-## Config
+```bash
+que
+```
 
-`que` works out of the box with no config needed. The config file lives at
-`~/.config/que/config.toml` by default. You can view it with `que config`,
-create it with `que config init`, edit it with `que config edit`, and use the
-built-in helper wizard from `que config` in an interactive terminal.
+3. `que` reads the clipboard, checks your library, downloads missing tracks, and imports them into Apple Music.
+
+If you prefer not to use the clipboard, pass the URL directly:
+
+```bash
+que "https://youtube.com/playlist?list=..."
+```
+
+## Everyday Usage
+
+```bash
+que
+que "https://youtube.com/watch?v=..."
+que "https://youtube.com/playlist?list=..."
+que --playlist "Road Trip" "https://youtube.com/playlist?list=..."
+que --dry-run "https://youtube.com/playlist?list=..."
+que config
+```
+
+## Power Usage
+
+### Command Reference
+
+- `que`: read the clipboard and process the current URL
+- `que <URL> [<URL> ...]`: process one or more explicit URLs
+- `que --dry-run <URL>`: preview what would be downloaded
+- `que --playlist "Name" <URL>`: add imported tracks to a named Apple Music playlist
+- `que --jobs N <URL>`: use `N` download workers for eligible tracks
+- `que --no-cache <URL>`: ignore the URL cache for that run
+- `que --threshold 75 <URL>`: override fuzzy matching for that run
+- `que list [--status downloaded|in_library|failed|skipped]`: show recent URL history
+- `que runs [--limit N]`: show recent run summaries and diagnostics
+- `que config`: show the current config and launch the helper wizard in an interactive terminal
+- `que config init|edit|path`: initialize, edit, or print the config path
+
+### Config Overview
+
+The config file lives at `~/.config/que/config.toml`.
+
+Most people only need to care about these options:
 
 ```toml
 [library]
@@ -80,79 +96,49 @@ paths = [
   "~/Music/Music/Media.localized",
   "~/Music/iTunes/iTunes Media",
 ]
-# Minimum confidence (0–100) to consider a track as "already in library".
-# Higher = stricter matching = more downloads. Default: 85.
 fuzzy_threshold = 85
 
 [download]
 staging_dir = "~/Downloads/que_staging"
-format = "m4a"
 
 [import]
-use_music_app = true        # notify Music.app via AppleScript
-mode = "move_then_music"    # current supported import strategy
+use_music_app = true
 destination = "~/Music/Music/Media.localized/Music"
-
-[cache]
-path = "~/.local/share/que/cache.db"
 ```
 
-## Performance metrics
+What they do:
 
-Every run now writes aggregate and per-track timing data into the cache DB:
+- `library.paths`: folders that `que` scans when checking whether a track already exists
+- `library.fuzzy_threshold`: higher means stricter matching, lower means more downloads
+- `download.staging_dir`: temporary download area before import
+- `import.use_music_app`: whether `que` should notify Apple Music after moving files
+- `import.destination`: where imported files are moved on disk
 
-- `processing_runs`: run mode, jobs, total URLs, queued downloads, run timings, downloaded bytes, average download rate, failure counts
-- `processing_run_items`: per-track queue wait, download time, tag/import time, file size, worker name, failure stage
+Use `que config` if you want a guided terminal flow instead of editing TOML manually.
 
-Use `que runs` for a quick terminal view. The `Mode` column distinguishes normal sync runs from benchmark runs. For deeper analysis, inspect `~/.local/share/que/cache.db` directly.
+### How It Works
 
-## Architecture
+`que` follows a simple pipeline:
 
-```
-que/
-├── main.py        CLI entry point, processing loop
-├── pipeline.py    sequential preflight + parallel download pipeline
-├── config.py      XDG config loader (~/.config/que/config.toml)
-├── config_cli.py  `que config` workflow
-├── cache.py       SQLite URL cache + run metrics (~/.local/share/que/cache.db)
-├── clipboard.py   macOS clipboard reader + URL parser
-├── resolver.py    yt-dlp metadata fetching (no download)
-├── library.py     LibraryChecker Protocol + FuzzyLibraryChecker
-├── downloader.py  yt-dlp audio download to staging dir
-├── tagger.py      mutagen ID3/MP4 tagging
-└── importer.py    file move + Music.app AppleScript integration
-```
+1. Read a URL from the clipboard or command line, then expand playlists into individual tracks.
+2. Resolve metadata, consult the cache, and check your local library.
+3. Download only the tracks that still need work.
+4. Tag the downloaded files, move them into your library folder, and notify Apple Music.
+5. Record history so later runs can skip known results quickly.
 
-### Replacing the library checker with an AI model
+### Diagnostics
 
-`library.py` defines a `LibraryChecker` Protocol. To swap in a semantic/AI checker:
+- `que list` shows recent per-URL history
+- `que runs` shows recent run-level diagnostics
+- Config path: `~/.config/que/config.toml`
+- Cache DB: `~/.local/share/que/cache.db`
 
-```python
-# your_ai_checker.py
-from que.library import CheckResult
+## Current Focus
 
-class AILibraryChecker:
-    def is_in_library(self, artist: str, title: str) -> CheckResult:
-        # call your model / embedding search here
-        ...
-```
+Current focus: keep the Apple Music workflow fast and reliable, keep improving large-playlist throughput and diagnostics, and later expand outward with lightweight companion surfaces, more source support, and a smarter local library-search experience.
 
-Then in `main.py`, replace:
-```python
-checker = FuzzyLibraryChecker(...)
-```
-with:
-```python
-checker = AILibraryChecker(...)
-```
+## Developer Docs
 
-No other changes needed.
-
-## Roadmap
-
-The phased contributor roadmap now lives in [ROADMAP.md](ROADMAP.md). It covers the planned order for CLI improvements, parallel downloads, shared local service work, quick-access clients, source expansion, and a separate intelligent library search feature.
-
-Phase 2 also ramps worker startup slightly and limits each ExtractAudio ffmpeg postprocessor to one thread to reduce startup CPU spikes on some systems.
-Single-worker runs keep the old serial flow so the first eligible track starts downloading immediately instead of waiting for full-playlist preflight.
-Downloads now explicitly request audio-only formats from yt-dlp instead of relying on its default format choice.
-Browser cookies are no longer sent on the default fast path; que retries with Chrome cookies only if the initial yt-dlp attempt fails.
+- [DEVELOPMENT.md](DEVELOPMENT.md)
+- [ARCHITECTURE.md](ARCHITECTURE.md)
+- [CHANGELOG.md](CHANGELOG.md)
