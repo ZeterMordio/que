@@ -60,33 +60,30 @@ que "https://youtube.com/playlist?list=..."
 ## Everyday Usage
 
 ```bash
-que
-que "https://youtube.com/watch?v=..."
-que "https://youtube.com/playlist?list=..."
-que --playlist "Road Trip" "https://youtube.com/playlist?list=..."
-que --dry-run "https://youtube.com/playlist?list=..."
-que config
+que                              # From clipboard
+que <URL>                        # Direct URL
+que --playlist "Blues" <URL>     # Add imported tracks to a playlist directly
+que --dry-run <URL>              # Preview download first
+que config                       # Start config wizard for help 🧙
 ```
 
 ## Power Usage
 
 ### Command Reference
 
-- `que`: read the clipboard and process the current URL
-- `que <URL> [<URL> ...]`: process one or more explicit URLs
-- `que --dry-run <URL>`: preview what would be downloaded
-- `que --playlist "Name" <URL>`: add imported tracks to a named Apple Music playlist
 - `que --jobs N <URL>`: use `N` download workers for eligible tracks
 - `que --no-cache <URL>`: ignore the URL cache for that run
-- `que --threshold 75 <URL>`: override fuzzy matching for that run
+- `que --threshold 75 <URL>`: override fuzzy matching parameter for that run
 - `que list [--status downloaded|in_library|failed|skipped]`: show recent URL history
 - `que runs [--limit N]`: show recent run summaries and diagnostics
-- `que config`: show the current config and launch the helper wizard in an interactive terminal
 - `que config init|edit|path`: initialize, edit, or print the config path
 
 ### Config Overview
 
 The config file lives at `~/.config/que/config.toml`.
+
+**Use `que config` if you want a guided terminal flow instead of editing TOML manually!**
+
 
 Most people only need to care about these options:
 
@@ -96,7 +93,6 @@ paths = [
   "~/Music/Music/Media.localized",
   "~/Music/iTunes/iTunes Media",
 ]
-fuzzy_threshold = 85
 
 [download]
 staging_dir = "~/Downloads/que_staging"
@@ -109,12 +105,9 @@ destination = "~/Music/Music/Media.localized/Music"
 What they do:
 
 - `library.paths`: folders that `que` scans when checking whether a track already exists
-- `library.fuzzy_threshold`: higher means stricter matching, lower means more downloads
 - `download.staging_dir`: temporary download area before import
 - `import.use_music_app`: whether `que` should notify Apple Music after moving files
 - `import.destination`: where imported files are moved on disk
-
-Use `que config` if you want a guided terminal flow instead of editing TOML manually.
 
 ### How It Works
 
@@ -133,9 +126,10 @@ Use `que config` if you want a guided terminal flow instead of editing TOML manu
 - Config path: `~/.config/que/config.toml`
 - Cache DB: `~/.local/share/que/cache.db`
 
-## Current Focus
+## Future Enhancements
 
-Current focus: keep the Apple Music workflow fast and reliable, keep improving large-playlist throughput and diagnostics, and later expand outward with lightweight companion surfaces, more source support, and a smarter local library-search experience.
+- **Chrome extension:** lightweight companion surface for one-click downloads.
+- Add Spotify & SoundCloud support.
 
 ## Developer Docs
 
