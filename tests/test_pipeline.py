@@ -450,3 +450,61 @@ def test_process_urls_jobs_one_uses_serial_flow(tmp_path, monkeypatch) -> None:
     rendered = output.getvalue()
     assert "Downloaded:" in rendered
     assert "Run 1 (normal): jobs=1" in rendered
+
+
+def test_process_urls_emits_structured_events(tmp_path, monkeypatch) -> None:
+    """Daemon-facing event hooks should expose item, results, and summary events."""
+    events: list[tuple[str, str | None, dict[str, object]]] = []
+    cache = FakeCache()
+    config = SimpleNamespace(
+        library_paths=[],
+        fuzzy_threshold=85,
+        staging_dir=tmp_path / "staging",
+        audio_format="m4a",
+        use_music_app=True,
+        import_destination=tmp_path / "library",
+    )
+
+    monkeypatch.setattr(
+        pipeline,
+        "_build_checker",
+        lambda config, ctx: FakeChecker(set()),
+    )
+    monkeypatch.setattr(pipeline, "resolve_metadata", lambda url: _meta(url))
+
+    def fake_download(
+        url: str,
+        staging_dir: Path,
+        audio_format: str,
+        ffmpeg_threads=None,
+    ):
+        staging_dir.mkdir(parents=True, exist_ok=True)
+        path = staging_dir / f"{url}.m4a"
+        path.write_text("audio", encoding="utf-8")
+        return path
+
+    monkeypatch.setattr(pipeline, "download_track", fake_download)
+    monkeypatch.setattr(pipeline, "tag_file", lambda *args, **kwargs: True)
+    monkeypatch.setattr(
+        pipeline,
+        "import_to_apple_music",
+        lambda *args, **kwargs: (True, "Imported"),
+    )
+
+    pipeline.process_urls(
+        urls=["u1"],
+        dry_run=False,
+        config=config,
+        cache=cache,
+        jobs=1,
+        console=None,
+        event_handler=lambda event_type, message, payload: events.append(
+            (event_type, message, payload)
+        ),
+    )
+
+    event_types = [event_type for event_type, _message, _payload in events]
+    assert "run_started" in event_types
+    assert "item_report" in event_types
+    assert "results" in event_types
+    assert "summary" in event_types

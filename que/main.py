@@ -12,6 +12,9 @@ Usage
   que --playlist NAME      Add imported tracks to a named Apple Music playlist
   que list                 Show recent processing history
   que runs                 Show recent run metrics
+  que status               Show daemon queue state
+  que daemon --foreground  Run the local daemon in the foreground
+  que daemon stop          Stop an idle daemon
   que config               Show the active config
   que list --status downloaded|in_library|failed
 
@@ -29,12 +32,11 @@ import sys
 from rich.console import Console
 from rich.table import Table
 
-from .cache import Cache, _NullCache
 from .clipboard import get_urls_from_clipboard, normalize_url, parse_urls
-from .config import load_config
 from .config_cli import cmd_config
-from .pipeline import process_urls
-from .resolver import expand_playlist, is_playlist_url
+from .service.client import DaemonClient
+from .service.models import JobRequest, ServiceEvent
+from .service.server import serve_forever
 
 console = Console()
 
@@ -44,10 +46,21 @@ console = Console()
 def _status_color(status: str) -> str:
     return {
         "downloaded": "green",
+        "benchmarked": "green",
         "in_library": "cyan",
         "failed": "red",
         "skipped": "yellow",
+        "cached": "magenta",
     }.get(status, "white")
+
+
+def _job_state_color(state: str) -> str:
+    return {
+        "queued": "yellow",
+        "running": "cyan",
+        "completed": "green",
+        "failed": "red",
+    }.get(state, "white")
 
 
 def _format_bytes(value: int) -> str:
@@ -72,9 +85,9 @@ def _format_rate(value: float | None) -> str:
 
 # ── `que list` subcommand ─────────────────────────────────────────────────────
 
-def cmd_list(cache: Cache, status_filter: str | None) -> None:
+def cmd_list(cache_like, status_filter: str | None) -> None:
     """Print the recent processing history from cache."""
-    rows = cache.recent(limit=50, status_filter=status_filter)
+    rows = cache_like.recent(limit=50, status_filter=status_filter)
 
     if not rows:
         console.print("[dim]No history found.[/dim]")
@@ -98,9 +111,9 @@ def cmd_list(cache: Cache, status_filter: str | None) -> None:
     console.print(table)
 
 
-def cmd_runs(cache: Cache, limit: int) -> None:
+def cmd_runs(cache_like, limit: int) -> None:
     """Print recent aggregate run metrics from cache."""
-    rows = cache.recent_runs(limit=limit)
+    rows = cache_like.recent_runs(limit=limit)
 
     if not rows:
         console.print("[dim]No run metrics found.[/dim]")
@@ -146,6 +159,140 @@ def cmd_runs(cache: Cache, limit: int) -> None:
     console.print(table)
 
 
+def cmd_status(client: DaemonClient) -> None:
+    """Print active and queued daemon jobs."""
+    queue = client.get_queue()
+    active = queue["active"]
+    queued = queue["queued"]
+
+    if active is None and not queued:
+        console.print("[dim]No queued or running jobs.[/dim]")
+        return
+
+    table = Table(title="que status", show_lines=False, highlight=True)
+    table.add_column("Job", style="bold")
+    table.add_column("State")
+    table.add_column("Pos", justify="right")
+    table.add_column("Done", justify="right")
+    table.add_column("Failed", justify="right")
+    table.add_column("URLs", justify="right")
+    table.add_column("Mode", no_wrap=True)
+
+    snapshots = ([active] if active is not None else []) + queued
+    for snapshot in snapshots:
+        color = _job_state_color(snapshot.state)
+        table.add_row(
+            snapshot.job_id,
+            f"[{color}]{snapshot.state}[/{color}]",
+            "—" if snapshot.position == 0 else str(snapshot.position),
+            str(snapshot.processed_count),
+            str(snapshot.failed_count),
+            str(snapshot.total_urls),
+            snapshot.run_mode,
+        )
+
+    console.print(table)
+
+
+def _render_results_event(reports: list[dict[str, object]]) -> None:
+    """Render the final ordered results table from an SSE payload."""
+    console.print()
+    table = Table(title="que results", show_lines=False, highlight=True)
+    table.add_column("#", style="dim", width=4)
+    table.add_column("Status", style="bold", width=12)
+    table.add_column("Track")
+    table.add_column("Notes")
+
+    for index, report in enumerate(reports, 1):
+        status = str(report["status"])
+        color = _status_color(status)
+        artist = str(report["artist"] or "")
+        title = str(report["title"] or "")
+        note = str(report["note"])
+        track = f"{artist} - {title}" if artist else (title or "—")
+        table.add_row(
+            str(index),
+            f"[{color}]{status}[/{color}]",
+            track,
+            note,
+        )
+
+    console.print(table)
+
+
+def _render_summary_event(payload: dict[str, object]) -> None:
+    """Render the final run summary from an SSE payload."""
+    stats = payload["stats"]
+    run_mode = str(payload["run_mode"])
+    run_id = payload["run_id"]
+    jobs = int(payload["jobs"])
+    preflight_seconds = float(payload["preflight_seconds"])
+    download_phase_seconds = float(payload["download_phase_seconds"])
+    total_seconds = float(payload["total_seconds"])
+
+    console.print()
+    console.rule("[bold]Summary[/bold]")
+    if run_mode == "benchmark":
+        console.print(
+            f"  [green]{stats['benchmarked']} benchmark downloads[/green]   "
+            f"[red]{stats['failed']} failed[/red]"
+        )
+    else:
+        console.print(
+            f"  [green]{stats['downloaded']} downloaded & imported[/green]   "
+            f"[cyan]{stats['in_library']} already in library[/cyan]   "
+            f"[dim]{stats['cached']} cached (skipped)[/dim]   "
+            f"[yellow]{stats['skipped']} dry-run skipped[/yellow]   "
+            f"[red]{stats['failed']} failed[/red]"
+        )
+    if run_id is not None:
+        console.print(
+            f"[dim]Run {run_id} ({run_mode}): jobs={jobs}, preflight {preflight_seconds:.2f}s, "
+            f"download phase {download_phase_seconds:.2f}s, total {total_seconds:.2f}s[/dim]"
+        )
+    console.print()
+
+
+def _render_service_event(event: ServiceEvent) -> None:
+    """Render one service event into the current CLI session."""
+    if event.type == "results":
+        reports = event.payload.get("reports", [])
+        if isinstance(reports, list):
+            _render_results_event(reports)
+        return
+
+    if event.type == "summary":
+        _render_summary_event(event.payload)
+        return
+
+    if event.type in {"summary_counts", "summary_run", "item_report"}:
+        return
+
+    if event.message:
+        console.print(event.message)
+
+
+def _collect_urls(raw_urls: list[str]) -> list[str]:
+    """Normalize direct CLI URL input."""
+    urls: list[str] = []
+    for raw in raw_urls:
+        found = parse_urls(raw)
+        urls.extend(found if found else [normalize_url(raw)])
+    return urls
+
+
+def _stream_job(client: DaemonClient, job_id: str) -> None:
+    """Tail a daemon-backed job until the server closes the event stream."""
+    for event in client.stream_events(job_id):
+        _render_service_event(event)
+
+
+def _print_error_and_exit(message: str) -> None:
+    """Render a user-facing error and exit non-zero."""
+    console.print(f"[red]{message}[/red]")
+    raise SystemExit(1)
+
+
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -158,7 +305,7 @@ def main() -> None:
             raise argparse.ArgumentTypeError("--jobs must be >= 1")
         return parsed
 
-    # ── Handle `que list [--status ...]` before normal parsing ───────────────
+    # ── Handle daemon-backed subcommands before normal parsing ────────────────
     # This avoids argparse confusing URLs with subcommand names when both
     # positional args and subparsers are present.
     if len(sys.argv) > 1 and sys.argv[1] == "list":
@@ -170,12 +317,10 @@ def main() -> None:
             help="Filter history by status.",
         )
         list_args = list_parser.parse_args(sys.argv[2:])
-        config = load_config()
-        cache: Cache | _NullCache = Cache(config.cache_path)
         try:
-            cmd_list(cache, list_args.status)  # type: ignore[arg-type]
-        finally:
-            cache.close()
+            cmd_list(DaemonClient(), list_args.status)
+        except RuntimeError as exc:
+            _print_error_and_exit(str(exc))
         return
 
     if len(sys.argv) > 1 and sys.argv[1] == "config":
@@ -191,12 +336,45 @@ def main() -> None:
             help="How many recent runs to show. (default: 20)",
         )
         runs_args = runs_parser.parse_args(sys.argv[2:])
-        config = load_config()
-        cache = Cache(config.cache_path)
         try:
-            cmd_runs(cache, runs_args.limit)
-        finally:
-            cache.close()
+            cmd_runs(DaemonClient(), runs_args.limit)
+        except RuntimeError as exc:
+            _print_error_and_exit(str(exc))
+        return
+
+    if len(sys.argv) > 1 and sys.argv[1] == "status":
+        try:
+            cmd_status(DaemonClient())
+        except RuntimeError as exc:
+            _print_error_and_exit(str(exc))
+        return
+
+    if len(sys.argv) > 1 and sys.argv[1] == "daemon":
+        daemon_parser = argparse.ArgumentParser(prog="que daemon")
+        daemon_parser.add_argument(
+            "--foreground",
+            action="store_true",
+            help="Run the daemon in the foreground.",
+        )
+        daemon_subparsers = daemon_parser.add_subparsers(dest="command")
+        daemon_subparsers.add_parser("stop", help="Stop an idle daemon.")
+        daemon_args = daemon_parser.parse_args(sys.argv[2:])
+
+        if daemon_args.command == "stop":
+            try:
+                DaemonClient(autostart=False).stop()
+            except RuntimeError as exc:
+                _print_error_and_exit(str(exc))
+            return
+
+        if daemon_args.foreground:
+            try:
+                serve_forever()
+            except RuntimeError as exc:
+                _print_error_and_exit(str(exc))
+            return
+
+        daemon_parser.print_help()
         return
 
     # ── Normal sync / download flow ───────────────────────────────────────────
@@ -209,6 +387,9 @@ def main() -> None:
             "  que --benchmark      Benchmark download-engine throughput\n"
             "  que list             Show processing history\n"
             "  que runs             Show run metrics\n"
+            "  que status           Show daemon queue status\n"
+            "  que daemon --foreground\n"
+            "                       Run the local daemon in the foreground\n"
             "  que config           View or edit config\n"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -268,75 +449,35 @@ def main() -> None:
     if args.benchmark and args.playlist:
         parser.error("--benchmark cannot be combined with --playlist")
 
-    # ── Load config & cache ──────────────────────────────────────────────────
-    config = load_config()
+    # ── Collect URLs and submit to daemon ────────────────────────────────────
+    if args.urls:
+        urls = _collect_urls(args.urls)
+    else:
+        console.print("[bold]que[/bold] — reading clipboard…")
+        urls = get_urls_from_clipboard()
 
-    if args.threshold is not None:
-        config.fuzzy_threshold = args.threshold
-    if args.playlist and not config.use_music_app:
-        # Reason: playlist assignment only works via Music.app scripting.
-        config.use_music_app = True
+    if not urls:
         console.print(
-            "[yellow]Playlist import requires Music.app integration; "
-            "enabling it for this run.[/yellow]"
+            "[yellow]No supported URLs found "
+            "(clipboard is empty or contains no YouTube / SoundCloud links).[/yellow]"
         )
+        sys.exit(0)
 
-    cache = (
-        Cache(config.cache_path)
-        if args.benchmark or not args.no_cache
-        else _NullCache()
+    request = JobRequest(
+        urls=urls,
+        dry_run=args.dry_run,
+        benchmark=args.benchmark,
+        playlist_name=args.playlist,
+        jobs=args.jobs,
+        threshold_override=args.threshold,
+        use_cache=not args.no_cache,
     )
-
     try:
-        # ── Collect URLs ─────────────────────────────────────────────────────
-        if args.urls:
-            urls: list[str] = []
-            for u in args.urls:
-                found = parse_urls(u)
-                urls.extend(found if found else [normalize_url(u)])
-        else:
-            console.print("[bold]que[/bold] — reading clipboard…")
-            urls = get_urls_from_clipboard()
-
-        if not urls:
-            console.print(
-                "[yellow]No supported URLs found "
-                "(clipboard is empty or contains no YouTube / SoundCloud links).[/yellow]"
-            )
-            sys.exit(0)
-
-        # ── Expand any playlist URLs into individual track URLs ───────────────
-        expanded: list[str] = []
-        for url in urls:
-            if is_playlist_url(url):
-                with console.status("  Expanding playlist…", spinner="dots"):
-                    tracks = expand_playlist(url)
-                console.print(
-                    f"  📋 Playlist expanded → [bold]{len(tracks)}[/bold] tracks"
-                )
-                expanded.extend(tracks)
-            else:
-                expanded.append(url)
-        urls = expanded
-
-        console.print(
-            f"Found [bold]{len(urls)}[/bold] URL(s)"
-            + (" [dim](dry-run)[/dim]" if args.dry_run else "")
-        )
-
-        process_urls(
-            urls,
-            dry_run=args.dry_run,
-            config=config,
-            cache=cache,
-            playlist_name=args.playlist,
-            jobs=args.jobs,
-            benchmark=args.benchmark,
-            console=console,
-        )
-
-    finally:
-        cache.close()
+        client = DaemonClient()
+        snapshot = client.submit_job(request)
+        _stream_job(client, snapshot.job_id)
+    except RuntimeError as exc:
+        _print_error_and_exit(str(exc))
 
 
 if __name__ == "__main__":

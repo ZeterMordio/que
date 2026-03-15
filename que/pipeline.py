@@ -9,8 +9,10 @@ from __future__ import annotations
 
 import shutil
 import uuid
+from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
+from contextlib import nullcontext
+from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
 from threading import current_thread
@@ -27,6 +29,7 @@ from .resolver import TrackMeta, resolve_metadata
 from .tagger import tag_file
 
 WORKER_START_STAGGER_SECONDS = 0.35
+EventHandler = Callable[[str, str | None, dict[str, Any]], None]
 
 
 @dataclass
@@ -93,6 +96,69 @@ class DownloadResult:
     error: str | None = None
 
 
+@dataclass
+class ProcessResult:
+    """Final structured result for one pipeline run."""
+
+    run_id: int | None
+    run_mode: str
+    jobs: int
+    total_urls: int
+    reports: dict[int, TrackReport]
+    stats: dict[str, int]
+    preflight_seconds: float
+    download_phase_seconds: float
+    total_seconds: float
+    queued_downloads: int
+
+
+@dataclass(frozen=True)
+class RunContext:
+    """Runtime helpers for emitting logs and structured events."""
+
+    console: Console | None = None
+    event_handler: EventHandler | None = None
+
+    def emit(
+        self,
+        event_type: str,
+        message: str | None = None,
+        **payload: Any,
+    ) -> None:
+        """Emit a structured event when configured."""
+        if self.event_handler is None:
+            return
+        self.event_handler(event_type, message, payload)
+
+    def log(
+        self,
+        message: str,
+        *,
+        event_type: str = "log",
+        **payload: Any,
+    ) -> None:
+        """Render a log line locally and emit it for remote observers."""
+        if self.console is not None:
+            self.console.print(message)
+        self.emit(event_type, message, **payload)
+
+    def blank(self) -> None:
+        """Render a blank line locally."""
+        if self.console is not None:
+            self.console.print()
+
+    def rule(self, title: str) -> None:
+        """Render a rule locally."""
+        if self.console is not None:
+            self.console.rule(title)
+
+    def status(self, message: str):
+        """Return a local spinner context when a console exists."""
+        if self.console is None:
+            return nullcontext()
+        return self.console.status(message, spinner="dots")
+
+
 def _now_iso() -> str:
     """Return the current local timestamp as ISO text."""
     return datetime.now().isoformat()
@@ -121,7 +187,12 @@ def _plain_label(artist: str, title: str) -> str:
     return title or "—"
 
 
-def _build_checker(config: Any, console: Console) -> FuzzyLibraryChecker:
+def _emit_item_report(ctx: RunContext, report: TrackReport) -> None:
+    """Emit the finalized report for one item."""
+    ctx.emit("item_report", report=asdict(report))
+
+
+def _build_checker(config: Any, ctx: RunContext) -> FuzzyLibraryChecker:
     """Construct and announce the library checker state."""
     checker = FuzzyLibraryChecker(
         library_paths=config.library_paths,
@@ -131,22 +202,32 @@ def _build_checker(config: Any, console: Console) -> FuzzyLibraryChecker:
     existing = [path for path in config.library_paths if path.exists()]
     if not existing:
         paths_str = "\n     ".join(str(path) for path in config.library_paths)
-        console.print(
+        ctx.log(
             f"[yellow]⚠  No library paths found. Checked:[/yellow]\n     {paths_str}\n"
             f"   Add your music folder to [bold]~/.config/que/config.toml[/bold]:\n"
-            f'   [dim][[library]]\n   paths = ["~/Music/your-folder"][/dim]'
+            f'   [dim][[library]]\n   paths = ["~/Music/your-folder"][/dim]',
+            event_type="library_state",
+            state="missing_paths",
         )
     elif not checker._tracks:
         paths_str = ", ".join(str(path) for path in existing)
-        console.print(
+        ctx.log(
             "[yellow]⚠  Library paths exist but no audio files found:[/yellow] "
-            f"[dim]{paths_str}[/dim]"
+            f"[dim]{paths_str}[/dim]",
+            event_type="library_state",
+            state="empty",
         )
     else:
         source_label = f"via {checker._source}"
         if checker._source == "filesystem":
             source_label += f" ({', '.join(str(path) for path in existing)})"
-        console.print(f"[dim]📚 Library: {len(checker._tracks)} tracks {source_label}[/dim]")
+        ctx.log(
+            f"[dim]📚 Library: {len(checker._tracks)} tracks {source_label}[/dim]",
+            event_type="library_state",
+            state="ready",
+            track_count=len(checker._tracks),
+            source=checker._source,
+        )
 
     return checker
 
@@ -213,10 +294,10 @@ def _preflight(
     jobs: int,
     config: Any,
     cache: Any,
-    console: Console,
+    ctx: RunContext,
 ) -> tuple[list[DownloadTask], dict[int, TrackReport], dict[str, int]]:
     """Run metadata/cache/library checks in input order."""
-    checker = None if benchmark else _build_checker(config, console)
+    checker = None if benchmark else _build_checker(config, ctx)
     run_root = config.staging_dir / f"run-{uuid.uuid4().hex[:8]}"
     reports: dict[int, TrackReport] = {}
     download_tasks: list[DownloadTask] = []
@@ -232,13 +313,23 @@ def _preflight(
     for index, url in enumerate(urls, 1):
         item_started_at = _now_iso()
         item_started_perf = perf_counter()
-        console.print(f"\n[dim]({index}/{len(urls)})[/dim] [dim]{url}[/dim]")
+        ctx.log(
+            f"\n[dim]({index}/{len(urls)})[/dim] [dim]{url}[/dim]",
+            event_type="item_started",
+            index=index,
+            url=url,
+            total=len(urls),
+        )
 
         cached = None if benchmark else cache.get(url)
         if cached:
-            console.print(
+            ctx.log(
                 f"  ⏭  [dim]Cached ({cached.status}):[/dim] "
-                f"{_label(cached.artist, cached.title)}"
+                f"{_label(cached.artist, cached.title)}",
+                event_type="cache_hit",
+                index=index,
+                url=url,
+                status=cached.status,
             )
             stats["cached"] += 1
             reports[index] = _make_report(
@@ -252,6 +343,7 @@ def _preflight(
                 committed_at=_now_iso(),
                 total_item_seconds=perf_counter() - item_started_perf,
             )
+            _emit_item_report(ctx, reports[index])
             continue
 
         if benchmark:
@@ -262,12 +354,17 @@ def _preflight(
                 raw_title=url,
             )
         else:
-            with console.status("  Fetching metadata…", spinner="dots"):
+            with ctx.status("  Fetching metadata…"):
                 meta = resolve_metadata(url)
 
         if not meta:
             message = "Could not fetch metadata — skipping"
-            console.print(f"  [red]✗  {message}[/red]")
+            ctx.log(
+                f"  [red]✗  {message}[/red]",
+                event_type="metadata_failed",
+                index=index,
+                url=url,
+            )
             if not benchmark:
                 cache.set(url, "", "", "failed")
             stats["failed"] += 1
@@ -283,17 +380,31 @@ def _preflight(
                 total_item_seconds=perf_counter() - item_started_perf,
                 failure_stage="metadata",
             )
+            _emit_item_report(ctx, reports[index])
             continue
 
-        console.print(f"  🎵 {_label(meta.artist, meta.title)}")
+        ctx.log(
+            f"  🎵 {_label(meta.artist, meta.title)}",
+            event_type="metadata_resolved",
+            index=index,
+            url=url,
+            artist=meta.artist,
+            title=meta.title,
+        )
         if meta.raw_title != meta.title:
-            console.print(f"     [dim]raw: {meta.raw_title}[/dim]")
+            ctx.log(
+                f"     [dim]raw: {meta.raw_title}[/dim]",
+                event_type="metadata_raw_title",
+                index=index,
+                url=url,
+                raw_title=meta.raw_title,
+            )
 
         if not benchmark and checker is not None:
             result = checker.is_in_library(meta.artist, meta.title)
             if result.in_library:
                 note = f"Already in library — {result.reason}"
-                console.print(
+                ctx.log(
                     f"  [cyan]✓  Already in library[/cyan]  [dim]{result.reason}[/dim]"
                 )
                 cache.set(url, meta.title, meta.artist, "in_library")
@@ -309,14 +420,31 @@ def _preflight(
                     committed_at=_now_iso(),
                     total_item_seconds=perf_counter() - item_started_perf,
                 )
+                _emit_item_report(ctx, reports[index])
                 continue
 
-            console.print(f"  [yellow]↓  Not in library[/yellow]  [dim]{result.reason}[/dim]")
+            ctx.log(
+                f"  [yellow]↓  Not in library[/yellow]  [dim]{result.reason}[/dim]",
+                event_type="library_miss",
+                index=index,
+                url=url,
+                reason=result.reason,
+            )
         elif benchmark:
-            console.print("  [blue]≈  Benchmark mode[/blue]  [dim]cache/library bypassed[/dim]")
+            ctx.log(
+                "  [blue]≈  Benchmark mode[/blue]  [dim]cache/library bypassed[/dim]",
+                event_type="benchmark_item",
+                index=index,
+                url=url,
+            )
 
         if dry_run:
-            console.print("  [dim][dry-run] Would download[/dim]")
+            ctx.log(
+                "  [dim][dry-run] Would download[/dim]",
+                event_type="dry_run_item",
+                index=index,
+                url=url,
+            )
             stats["skipped"] += 1
             reports[index] = _make_report(
                 index=index,
@@ -329,14 +457,19 @@ def _preflight(
                 committed_at=_now_iso(),
                 total_item_seconds=perf_counter() - item_started_perf,
             )
+            _emit_item_report(ctx, reports[index])
             continue
 
         queued_at = _now_iso()
         queued_perf = perf_counter()
         staging_dir = run_root / f"{index:04d}"
-        console.print(
+        ctx.log(
             f"  [blue]→  Queued for {'benchmark ' if benchmark else ''}download[/blue]  "
-            f"[dim]job {index}/{len(urls)}[/dim]"
+            f"[dim]job {index}/{len(urls)}[/dim]",
+            event_type="download_queued",
+            index=index,
+            url=url,
+            queue_index=index,
         )
         download_tasks.append(
             DownloadTask(
@@ -429,11 +562,11 @@ def _process_urls_serial(
     dry_run: bool,
     config: Any,
     cache: Any,
-    console: Console,
+    ctx: RunContext,
     playlist_name: str | None,
 ) -> tuple[dict[int, TrackReport], dict[str, int]]:
     """Process URLs with the old serial flow for responsive single-worker runs."""
-    checker = _build_checker(config, console)
+    checker = _build_checker(config, ctx)
     reports: dict[int, TrackReport] = {}
     stats = {
         "downloaded": 0,
@@ -447,13 +580,23 @@ def _process_urls_serial(
     for index, url in enumerate(urls, 1):
         item_started_at = _now_iso()
         item_started_perf = perf_counter()
-        console.print(f"\n[dim]({index}/{len(urls)})[/dim] [dim]{url}[/dim]")
+        ctx.log(
+            f"\n[dim]({index}/{len(urls)})[/dim] [dim]{url}[/dim]",
+            event_type="item_started",
+            index=index,
+            url=url,
+            total=len(urls),
+        )
 
         cached = cache.get(url)
         if cached:
-            console.print(
+            ctx.log(
                 f"  ⏭  [dim]Cached ({cached.status}):[/dim] "
-                f"{_label(cached.artist, cached.title)}"
+                f"{_label(cached.artist, cached.title)}",
+                event_type="cache_hit",
+                index=index,
+                url=url,
+                status=cached.status,
             )
             stats["cached"] += 1
             reports[index] = _make_report(
@@ -467,14 +610,20 @@ def _process_urls_serial(
                 committed_at=_now_iso(),
                 total_item_seconds=perf_counter() - item_started_perf,
             )
+            _emit_item_report(ctx, reports[index])
             continue
 
-        with console.status("  Fetching metadata…", spinner="dots"):
+        with ctx.status("  Fetching metadata…"):
             meta = resolve_metadata(url)
 
         if not meta:
             message = "Could not fetch metadata — skipping"
-            console.print(f"  [red]✗  {message}[/red]")
+            ctx.log(
+                f"  [red]✗  {message}[/red]",
+                event_type="metadata_failed",
+                index=index,
+                url=url,
+            )
             cache.set(url, "", "", "failed")
             stats["failed"] += 1
             reports[index] = _make_report(
@@ -489,16 +638,36 @@ def _process_urls_serial(
                 total_item_seconds=perf_counter() - item_started_perf,
                 failure_stage="metadata",
             )
+            _emit_item_report(ctx, reports[index])
             continue
 
-        console.print(f"  🎵 {_label(meta.artist, meta.title)}")
+        ctx.log(
+            f"  🎵 {_label(meta.artist, meta.title)}",
+            event_type="metadata_resolved",
+            index=index,
+            url=url,
+            artist=meta.artist,
+            title=meta.title,
+        )
         if meta.raw_title != meta.title:
-            console.print(f"     [dim]raw: {meta.raw_title}[/dim]")
+            ctx.log(
+                f"     [dim]raw: {meta.raw_title}[/dim]",
+                event_type="metadata_raw_title",
+                index=index,
+                url=url,
+                raw_title=meta.raw_title,
+            )
 
         result = checker.is_in_library(meta.artist, meta.title)
         if result.in_library:
             note = f"Already in library — {result.reason}"
-            console.print(f"  [cyan]✓  Already in library[/cyan]  [dim]{result.reason}[/dim]")
+            ctx.log(
+                f"  [cyan]✓  Already in library[/cyan]  [dim]{result.reason}[/dim]",
+                event_type="library_hit",
+                index=index,
+                url=url,
+                reason=result.reason,
+            )
             cache.set(url, meta.title, meta.artist, "in_library")
             stats["in_library"] += 1
             reports[index] = _make_report(
@@ -512,11 +681,23 @@ def _process_urls_serial(
                 committed_at=_now_iso(),
                 total_item_seconds=perf_counter() - item_started_perf,
             )
+            _emit_item_report(ctx, reports[index])
             continue
 
-        console.print(f"  [yellow]↓  Not in library[/yellow]  [dim]{result.reason}[/dim]")
+        ctx.log(
+            f"  [yellow]↓  Not in library[/yellow]  [dim]{result.reason}[/dim]",
+            event_type="library_miss",
+            index=index,
+            url=url,
+            reason=result.reason,
+        )
         if dry_run:
-            console.print("  [dim][dry-run] Would download[/dim]")
+            ctx.log(
+                "  [dim][dry-run] Would download[/dim]",
+                event_type="dry_run_item",
+                index=index,
+                url=url,
+            )
             stats["skipped"] += 1
             reports[index] = _make_report(
                 index=index,
@@ -529,11 +710,12 @@ def _process_urls_serial(
                 committed_at=_now_iso(),
                 total_item_seconds=perf_counter() - item_started_perf,
             )
+            _emit_item_report(ctx, reports[index])
             continue
 
         download_started_at = _now_iso()
         download_start = perf_counter()
-        with console.status("  Downloading…", spinner="dots"):
+        with ctx.status("  Downloading…"):
             attempt = download_track(
                 url,
                 config.staging_dir,
@@ -574,15 +756,27 @@ def _process_urls_serial(
                 download_bytes_per_second=_safe_rate(file_size_bytes, download_seconds),
                 failure_stage="download",
             )
+            _emit_item_report(ctx, reports[index])
             continue
 
-        console.print(f"  [green]✓  Downloaded:[/green] {downloaded_path.name}")
+        ctx.log(
+            f"  [green]✓  Downloaded:[/green] {downloaded_path.name}",
+            event_type="download_completed",
+            index=index,
+            url=url,
+            file_name=downloaded_path.name,
+        )
 
         tag_start = perf_counter()
         tagged = tag_file(downloaded_path, meta.artist, meta.title)
         tag_seconds = perf_counter() - tag_start
         if tagged:
-            console.print("  🏷  Tagged with artist / title metadata")
+            ctx.log(
+                "  🏷  Tagged with artist / title metadata",
+                event_type="tag_completed",
+                index=index,
+                url=url,
+            )
 
         import_start = perf_counter()
         ok, message = import_to_apple_music(
@@ -598,7 +792,12 @@ def _process_urls_serial(
         total_item_seconds = perf_counter() - item_started_perf
 
         if ok:
-            console.print(f"  [green]✓  {message}[/green]")
+            ctx.log(
+                f"  [green]✓  {message}[/green]",
+                event_type="import_completed",
+                index=index,
+                url=url,
+            )
             cache.set(url, meta.title, meta.artist, "downloaded")
             stats["downloaded"] += 1
             reports[index] = _make_report(
@@ -619,9 +818,15 @@ def _process_urls_serial(
                 file_size_bytes=file_size_bytes,
                 download_bytes_per_second=_safe_rate(file_size_bytes, download_seconds),
             )
+            _emit_item_report(ctx, reports[index])
             continue
 
-        console.print(f"  [red]✗  {message}[/red]")
+        ctx.log(
+            f"  [red]✗  {message}[/red]",
+            event_type="import_failed",
+            index=index,
+            url=url,
+        )
         cache.set(url, meta.title, meta.artist, "failed")
         stats["failed"] += 1
         reports[index] = _make_report(
@@ -643,6 +848,7 @@ def _process_urls_serial(
             download_bytes_per_second=_safe_rate(file_size_bytes, download_seconds),
             failure_stage="import",
         )
+        _emit_item_report(ctx, reports[index])
 
     return reports, stats
 
@@ -654,6 +860,7 @@ def _commit_download_result(
     cache: Any,
     playlist_name: str | None,
     stats: dict[str, int],
+    ctx: RunContext,
 ) -> TrackReport:
     """Tag/import/cache a completed download result in the main thread."""
     committed_at = _now_iso()
@@ -795,7 +1002,7 @@ def _run_parallel_downloads(
     benchmark: bool,
     config: Any,
     cache: Any,
-    console: Console,
+    ctx: RunContext,
     playlist_name: str | None,
     reports: dict[int, TrackReport],
     stats: dict[str, int],
@@ -809,13 +1016,17 @@ def _run_parallel_downloads(
             current_index += 1
         return current_index
 
-    console.print(
+    ctx.log(
         "\n[bold]Download Queue[/bold]  "
-        f"[dim]{len(download_tasks)} track(s), {jobs} worker(s)[/dim]"
+        f"[dim]{len(download_tasks)} track(s), {jobs} worker(s)[/dim]",
+        event_type="download_queue_started",
+        total=len(download_tasks),
+        jobs=jobs,
     )
     if jobs > 1 and len(download_tasks) > 1:
-        console.print(
-            "[dim]Gentle worker startup enabled to reduce initial CPU / I/O spikes.[/dim]"
+        ctx.log(
+            "[dim]Gentle worker startup enabled to reduce initial CPU / I/O spikes.[/dim]",
+            event_type="download_queue_staggered",
         )
 
     pending_results: dict[int, DownloadResult] = {}
@@ -847,16 +1058,22 @@ def _run_parallel_downloads(
                 )
 
             if result.downloaded_path:
-                console.print(
+                ctx.log(
                     f"  [green]✓[/green] {'Benchmark ' if benchmark else ''}download "
                     f"finished for "
-                    f"{_label(result.meta.artist, result.meta.title)}"
+                    f"{_label(result.meta.artist, result.meta.title)}",
+                    event_type="worker_download_finished",
+                    index=result.index,
+                    url=result.url,
                 )
             else:
-                console.print(
+                ctx.log(
                     f"  [red]✗[/red] {'Benchmark ' if benchmark else ''}download "
                     f"failed for "
-                    f"{_label(result.meta.artist, result.meta.title)}"
+                    f"{_label(result.meta.artist, result.meta.title)}",
+                    event_type="worker_download_failed",
+                    index=result.index,
+                    url=result.url,
                 )
 
             pending_results[result.index] = result
@@ -868,32 +1085,39 @@ def _run_parallel_downloads(
                     cache=cache,
                     playlist_name=playlist_name,
                     stats=stats,
+                    ctx=ctx,
                 )
                 reports[next_commit_index] = committed
+                _emit_item_report(ctx, committed)
                 next_commit_index += 1
                 next_commit_index = advance_committed_gaps(next_commit_index)
 
 
-def _render_results(urls: list[str], reports: dict[int, TrackReport], console: Console) -> None:
+def _render_results(urls: list[str], reports: dict[int, TrackReport], ctx: RunContext) -> None:
     """Render final ordered results in a stable table."""
-    console.print()
-    table = Table(title="que results", show_lines=False, highlight=True)
-    table.add_column("#", style="dim", width=4)
-    table.add_column("Status", style="bold", width=12)
-    table.add_column("Track")
-    table.add_column("Notes")
+    if ctx.console is not None:
+        ctx.console.print()
+        table = Table(title="que results", show_lines=False, highlight=True)
+        table.add_column("#", style="dim", width=4)
+        table.add_column("Status", style="bold", width=12)
+        table.add_column("Track")
+        table.add_column("Notes")
 
-    for index in range(1, len(urls) + 1):
-        report = reports[index]
-        color = _status_color(report.status)
-        table.add_row(
-            str(index),
-            f"[{color}]{report.status}[/{color}]",
-            _plain_label(report.artist, report.title),
-            report.note,
-        )
+        for index in range(1, len(urls) + 1):
+            report = reports[index]
+            color = _status_color(report.status)
+            table.add_row(
+                str(index),
+                f"[{color}]{report.status}[/{color}]",
+                _plain_label(report.artist, report.title),
+                report.note,
+            )
 
-    console.print(table)
+        ctx.console.print(table)
+    ctx.emit(
+        "results",
+        reports=[asdict(reports[index]) for index in range(1, len(urls) + 1)],
+    )
 
 
 def _persist_run_metrics(
@@ -977,7 +1201,7 @@ def _persist_run_metrics(
 
 def _print_summary(
     stats: dict[str, int],
-    console: Console,
+    ctx: RunContext,
     *,
     run_id: int | None,
     run_mode: str,
@@ -987,27 +1211,46 @@ def _print_summary(
     total_seconds: float,
 ) -> None:
     """Render the summary section."""
-    console.print()
-    console.rule("[bold]Summary[/bold]")
+    ctx.blank()
+    ctx.rule("[bold]Summary[/bold]")
     if run_mode == "benchmark":
-        console.print(
+        ctx.log(
             f"  [green]{stats['benchmarked']} benchmark downloads[/green]   "
-            f"[red]{stats['failed']} failed[/red]"
+            f"[red]{stats['failed']} failed[/red]",
+            event_type="summary_counts",
         )
     else:
-        console.print(
+        ctx.log(
             f"  [green]{stats['downloaded']} downloaded & imported[/green]   "
             f"[cyan]{stats['in_library']} already in library[/cyan]   "
             f"[dim]{stats['cached']} cached (skipped)[/dim]   "
             f"[yellow]{stats['skipped']} dry-run skipped[/yellow]   "
-            f"[red]{stats['failed']} failed[/red]"
+            f"[red]{stats['failed']} failed[/red]",
+            event_type="summary_counts",
         )
     if run_id is not None:
-        console.print(
+        ctx.log(
             f"[dim]Run {run_id} ({run_mode}): jobs={jobs}, preflight {preflight_seconds:.2f}s, "
-            f"download phase {download_phase_seconds:.2f}s, total {total_seconds:.2f}s[/dim]"
+            f"download phase {download_phase_seconds:.2f}s, total {total_seconds:.2f}s[/dim]",
+            event_type="summary_run",
+            run_id=run_id,
+            run_mode=run_mode,
+            jobs=jobs,
+            preflight_seconds=preflight_seconds,
+            download_phase_seconds=download_phase_seconds,
+            total_seconds=total_seconds,
         )
-    console.print()
+    ctx.blank()
+    ctx.emit(
+        "summary",
+        run_id=run_id,
+        run_mode=run_mode,
+        jobs=jobs,
+        stats=stats,
+        preflight_seconds=preflight_seconds,
+        download_phase_seconds=download_phase_seconds,
+        total_seconds=total_seconds,
+    )
 
 
 def process_urls(
@@ -1019,11 +1262,26 @@ def process_urls(
     jobs: int = 3,
     benchmark: bool = False,
     console: Console | None = None,
-) -> None:
+    event_handler: EventHandler | None = None,
+) -> ProcessResult:
     """Process URLs through preflight, parallel download, and serialized commit."""
-    active_console = console or Console()
+    if console is not None:
+        active_console = console
+    elif event_handler is None:
+        active_console = Console()
+    else:
+        active_console = None
+    ctx = RunContext(console=active_console, event_handler=event_handler)
     run_started_perf = perf_counter()
     run_mode = "benchmark" if benchmark else "normal"
+    ctx.emit(
+        "run_started",
+        run_mode=run_mode,
+        total_urls=len(urls),
+        jobs=jobs,
+        dry_run=dry_run,
+        playlist_name=playlist_name,
+    )
     run_id = cache.start_run(
         total_urls=len(urls),
         run_mode=run_mode,
@@ -1048,9 +1306,10 @@ def process_urls(
 
     try:
         if benchmark:
-            active_console.print(
+            ctx.log(
                 "[dim]Benchmark mode: skipping metadata, URL cache, library checks, "
-                "tagging, and Apple Music import; cleaning throwaway staging files.[/dim]"
+                "tagging, and Apple Music import; cleaning throwaway staging files.[/dim]",
+                event_type="benchmark_mode",
             )
         if not benchmark and jobs == 1:
             reports, stats = _process_urls_serial(
@@ -1058,7 +1317,7 @@ def process_urls(
                 dry_run=dry_run,
                 config=config,
                 cache=cache,
-                console=active_console,
+                ctx=ctx,
                 playlist_name=playlist_name,
             )
             download_phase_seconds = perf_counter() - run_started_perf
@@ -1070,10 +1329,15 @@ def process_urls(
                 jobs=jobs,
                 config=config,
                 cache=cache,
-                console=active_console,
+                ctx=ctx,
             )
             preflight_seconds = perf_counter() - run_started_perf
             queued_downloads = len(download_tasks)
+            ctx.emit(
+                "preflight_finished",
+                queued_downloads=queued_downloads,
+                preflight_seconds=preflight_seconds,
+            )
 
             if download_tasks:
                 download_phase_start = perf_counter()
@@ -1083,14 +1347,14 @@ def process_urls(
                     benchmark=benchmark,
                     config=config,
                     cache=cache,
-                    console=active_console,
+                    ctx=ctx,
                     playlist_name=playlist_name,
                     reports=reports,
                     stats=stats,
                 )
                 download_phase_seconds = perf_counter() - download_phase_start
 
-        _render_results(urls=urls, reports=reports, console=active_console)
+        _render_results(urls=urls, reports=reports, ctx=ctx)
     finally:
         total_seconds = perf_counter() - run_started_perf
         _persist_run_metrics(
@@ -1107,11 +1371,23 @@ def process_urls(
 
     _print_summary(
         stats=stats,
-        console=active_console,
+        ctx=ctx,
         run_id=run_id,
         run_mode=run_mode,
         jobs=jobs,
         preflight_seconds=preflight_seconds,
         download_phase_seconds=download_phase_seconds,
         total_seconds=total_seconds,
+    )
+    return ProcessResult(
+        run_id=run_id,
+        run_mode=run_mode,
+        jobs=jobs,
+        total_urls=len(urls),
+        reports=reports,
+        stats=stats,
+        preflight_seconds=preflight_seconds,
+        download_phase_seconds=download_phase_seconds,
+        total_seconds=total_seconds,
+        queued_downloads=queued_downloads,
     )

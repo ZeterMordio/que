@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Added Phase 3 local daemon support with a Unix-domain-socket HTTP API, FIFO queue state, per-job SSE event streaming, and daemon-backed `que`, `que list`, `que runs`, and `que status` flows.
+- Refactored the core pipeline to emit structured events so the CLI can render daemon-streamed progress without owning the processing logic.
+- Added daemon/client/state regression coverage for queue ordering, SSE delivery, autostart, and CLI proxy behavior.
+- Updated README, architecture notes, and development docs for the daemon-backed workflow and debugging commands.
 - Reworked the README into a user-facing landing page and added tracked root-level `DEVELOPMENT.md` and `ARCHITECTURE.md` docs for developer and agent-facing detail.
 - Added Phase 2 parallel downloads with `--jobs`, sequential preflight, and serialized tag/import/cache commits.
 - Added concurrency regression tests for ordered results, staging isolation, and main-thread cache writes.

@@ -7,6 +7,7 @@ Copy a URL, run one command, and let `que` check your library, download only the
 ## What It Does
 
 - Accepts a YouTube track or playlist URL from the clipboard or the command line
+- Auto-starts a local daemon so queue state, history, and live progress have one source of truth
 - Checks your local library before downloading, so obvious duplicates are skipped
 - Downloads missing tracks, tags them, and imports them into Apple Music
 - Can add newly imported tracks to a named Apple Music playlist
@@ -76,6 +77,9 @@ que config                       # Start config wizard for help 🧙
 - `que --threshold 75 <URL>`: override fuzzy matching parameter for that run
 - `que list [--status downloaded|in_library|failed|skipped]`: show recent URL history
 - `que runs [--limit N]`: show recent run summaries and diagnostics
+- `que status`: show active and queued daemon jobs
+- `que daemon --foreground`: run the local daemon in the foreground for debugging
+- `que daemon stop`: stop an idle daemon cleanly
 - `que config init|edit|path`: initialize, edit, or print the config path
 
 ### Config Overview
@@ -111,20 +115,24 @@ What they do:
 
 ### How It Works
 
-`que` follows a simple pipeline:
+`que` now runs through a local daemon-backed pipeline:
 
-1. Read a URL from the clipboard or command line, then expand playlists into individual tracks.
-2. Resolve metadata, consult the cache, and check your local library.
-3. Download only the tracks that still need work.
-4. Tag the downloaded files, move them into your library folder, and notify Apple Music.
-5. Record history so later runs can skip known results quickly.
+1. Read a URL from the clipboard or command line, then submit the job to the local daemon.
+2. The daemon expands playlists into individual tracks and owns queue/job state.
+3. The daemon resolves metadata, consults the cache, and checks your local library.
+4. It downloads only the tracks that still need work.
+5. It tags the downloaded files, moves them into your library folder, and notifies Apple Music.
+6. It records history and run metrics so later runs and future clients can reuse the same state.
 
 ### Diagnostics
 
 - `que list` shows recent per-URL history
 - `que runs` shows recent run-level diagnostics
+- `que status` shows active/queued jobs in the local daemon
 - Config path: `~/.config/que/config.toml`
 - Cache DB: `~/.local/share/que/cache.db`
+- Daemon socket: `~/.local/state/que/daemon.sock`
+- Daemon PID lock: `~/.local/state/que/daemon.pid`
 
 ## Future Enhancements
 
