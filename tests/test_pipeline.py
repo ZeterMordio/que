@@ -11,13 +11,22 @@ from rich.console import Console
 
 from que import pipeline
 from que.cache import Cache
+from que.importer import ImportResult
 
 
 class FakeChecker:
     """Stub library checker for pipeline tests."""
 
-    def __init__(self, in_library_urls: set[str]) -> None:
+    def __init__(
+        self,
+        in_library_urls: set[str],
+        *,
+        strict_in_library_urls: set[str] | None = None,
+    ) -> None:
         self._in_library_urls = in_library_urls
+        self._strict_in_library_urls = (
+            in_library_urls if strict_in_library_urls is None else strict_in_library_urls
+        )
 
     def is_in_library(self, artist: str, title: str):
         url = title.replace("Track ", "u")
@@ -29,6 +38,18 @@ class FakeChecker:
         return SimpleNamespace(
             in_library=False,
             reason="best score 0 < threshold 85",
+        )
+
+    def is_strictly_in_library(self, artist: str, title: str):
+        url = title.replace("Track ", "u")
+        if url in self._strict_in_library_urls:
+            return SimpleNamespace(
+                in_library=True,
+                reason="exact current-library match",
+            )
+        return SimpleNamespace(
+            in_library=False,
+            reason="no exact current-library match",
         )
 
 
@@ -72,6 +93,91 @@ def _meta(url: str) -> SimpleNamespace:
     )
 
 
+def _lookup(url: str, *, error: str | None = None, used_browser_cookies: bool = False):
+    """Build a fake metadata lookup payload for pipeline tests."""
+    return SimpleNamespace(
+        meta=None if error else _meta(url),
+        error=error,
+        used_browser_cookies=used_browser_cookies,
+    )
+
+
+def _import_result(
+    message: str,
+    *,
+    success: bool = True,
+    music_app_imported: bool = True,
+    final_path: Path | None = None,
+) -> ImportResult:
+    """Build an importer-like result payload for pipeline tests."""
+    return ImportResult(
+        success=success,
+        music_app_imported=music_app_imported,
+        message=message,
+        final_path=final_path,
+    )
+
+
+def test_metadata_failure_message_surfaces_youtube_bot_block() -> None:
+    """Anti-bot metadata failures should get a more truthful user-facing label."""
+    message = pipeline._metadata_failure_message(
+        "ERROR: [youtube] abc: Sign in to confirm you’re not a bot."
+    )
+
+    assert message == "YouTube blocked metadata lookup — skipping"
+
+
+def test_process_urls_does_not_short_circuit_cached_failed_entry(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    """Failed cache entries should be informational only, not a durable skip."""
+    output = io.StringIO()
+    console = Console(file=output, force_terminal=False, color_system=None)
+    cache = FakeCache(
+        cached={
+            "u1": SimpleNamespace(
+                status="failed",
+                artist="",
+                title="",
+            )
+        }
+    )
+    config = SimpleNamespace(
+        library_paths=[],
+        fuzzy_threshold=85,
+        staging_dir=tmp_path / "staging",
+        audio_format="m4a",
+        use_music_app=True,
+        import_destination=tmp_path / "library",
+    )
+
+    monkeypatch.setattr(
+        pipeline,
+        "_build_checker",
+        lambda config, console: FakeChecker(set()),
+    )
+    monkeypatch.setattr(pipeline, "resolve_metadata_lookup", lambda url: _lookup(url))
+    monkeypatch.setattr(
+        pipeline,
+        "download_track",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("download should not run")),
+    )
+
+    pipeline.process_urls(
+        urls=["u1"],
+        dry_run=True,
+        config=config,
+        cache=cache,
+        jobs=1,
+        console=console,
+    )
+
+    rendered = output.getvalue()
+    assert "retryable; continuing" in rendered
+    assert "Cached previous result: failed" not in rendered
+
+
 def test_process_urls_parallel_downloads_commit_in_input_order(
     tmp_path, monkeypatch
 ) -> None:
@@ -82,8 +188,8 @@ def test_process_urls_parallel_downloads_commit_in_input_order(
         cached={
             "u2": SimpleNamespace(
                 status="downloaded",
-                artist="Cached Artist",
-                title="Cached Track",
+                artist="Artist 2",
+                title="Track 2",
             )
         }
     )
@@ -100,9 +206,9 @@ def test_process_urls_parallel_downloads_commit_in_input_order(
     monkeypatch.setattr(
         pipeline,
         "_build_checker",
-        lambda config, console: FakeChecker({"u4"}),
+        lambda config, console: FakeChecker({"u2", "u4"}),
     )
-    monkeypatch.setattr(pipeline, "resolve_metadata", lambda url: _meta(url))
+    monkeypatch.setattr(pipeline, "resolve_metadata_lookup", lambda url: _lookup(url))
 
     def fake_download(
         url: str,
@@ -133,8 +239,15 @@ def test_process_urls_parallel_downloads_commit_in_input_order(
         playlist_name=None,
     ):
         if file_path.name == "u6.m4a":
-            return False, "Import failed in Apple Music"
-        return True, f"Imported via Apple Music -> {file_path.name}"
+            return _import_result(
+                "Import failed in Apple Music",
+                success=False,
+                music_app_imported=False,
+            )
+        return _import_result(
+            f"Imported via Apple Music -> {file_path.name}",
+            final_path=file_path,
+        )
 
     monkeypatch.setattr(pipeline, "import_to_apple_music", fake_import)
 
@@ -195,7 +308,7 @@ def test_process_urls_dry_run_never_submits_downloads(tmp_path, monkeypatch) -> 
         "_build_checker",
         lambda config, console: FakeChecker(set()),
     )
-    monkeypatch.setattr(pipeline, "resolve_metadata", lambda url: _meta(url))
+    monkeypatch.setattr(pipeline, "resolve_metadata_lookup", lambda url: _lookup(url))
     monkeypatch.setattr(
         pipeline,
         "download_track",
@@ -233,7 +346,7 @@ def test_process_urls_persists_run_metrics_in_sqlite(tmp_path, monkeypatch) -> N
         "_build_checker",
         lambda config, console: FakeChecker(set()),
     )
-    monkeypatch.setattr(pipeline, "resolve_metadata", lambda url: _meta(url))
+    monkeypatch.setattr(pipeline, "resolve_metadata_lookup", lambda url: _lookup(url))
 
     def fake_download(
         url: str,
@@ -251,9 +364,9 @@ def test_process_urls_persists_run_metrics_in_sqlite(tmp_path, monkeypatch) -> N
     monkeypatch.setattr(
         pipeline,
         "import_to_apple_music",
-        lambda file_path, artist, library_path, use_music_app, playlist_name=None: (
-            True,
+        lambda file_path, artist, library_path, use_music_app, playlist_name=None: _import_result(
             f"Imported via Apple Music -> {file_path.name}",
+            final_path=file_path,
         ),
     )
 
@@ -342,7 +455,7 @@ def test_process_urls_benchmark_mode_skips_library_import_and_cache(
     )
     monkeypatch.setattr(
         pipeline,
-        "resolve_metadata",
+        "resolve_metadata_lookup",
         lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("metadata used")),
     )
 
@@ -411,7 +524,7 @@ def test_process_urls_jobs_one_uses_serial_flow(tmp_path, monkeypatch) -> None:
         "_run_parallel_downloads",
         lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("parallel path used")),
     )
-    monkeypatch.setattr(pipeline, "resolve_metadata", lambda url: _meta(url))
+    monkeypatch.setattr(pipeline, "resolve_metadata_lookup", lambda url: _lookup(url))
     monkeypatch.setattr(
         pipeline,
         "_build_checker",
@@ -435,7 +548,10 @@ def test_process_urls_jobs_one_uses_serial_flow(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(
         pipeline,
         "import_to_apple_music",
-        lambda *args, **kwargs: (True, "Imported"),
+        lambda file_path, *args, **kwargs: _import_result(
+            "Imported",
+            final_path=file_path,
+        ),
     )
 
     pipeline.process_urls(
@@ -470,7 +586,7 @@ def test_process_urls_emits_structured_events(tmp_path, monkeypatch) -> None:
         "_build_checker",
         lambda config, ctx: FakeChecker(set()),
     )
-    monkeypatch.setattr(pipeline, "resolve_metadata", lambda url: _meta(url))
+    monkeypatch.setattr(pipeline, "resolve_metadata_lookup", lambda url: _lookup(url))
 
     def fake_download(
         url: str,
@@ -488,7 +604,10 @@ def test_process_urls_emits_structured_events(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(
         pipeline,
         "import_to_apple_music",
-        lambda *args, **kwargs: (True, "Imported"),
+        lambda file_path, *args, **kwargs: _import_result(
+            "Imported",
+            final_path=file_path,
+        ),
     )
 
     pipeline.process_urls(
@@ -508,3 +627,282 @@ def test_process_urls_emits_structured_events(tmp_path, monkeypatch) -> None:
     assert "item_report" in event_types
     assert "results" in event_types
     assert "summary" in event_types
+
+
+def test_process_urls_revalidates_stale_in_library_cache(tmp_path, monkeypatch) -> None:
+    """Stale in_library cache entries should fall through to a real download."""
+    output = io.StringIO()
+    console = Console(file=output, force_terminal=False, color_system=None)
+    cache = FakeCache(
+        cached={
+            "u1": SimpleNamespace(
+                status="in_library",
+                artist="Artist 1",
+                title="Track 1",
+            )
+        }
+    )
+    config = SimpleNamespace(
+        library_paths=[],
+        fuzzy_threshold=85,
+        staging_dir=tmp_path / "staging",
+        audio_format="m4a",
+        use_music_app=True,
+        import_destination=tmp_path / "library",
+    )
+
+    monkeypatch.setattr(
+        pipeline,
+        "_build_checker",
+        lambda config, ctx: FakeChecker(set()),
+    )
+    monkeypatch.setattr(pipeline, "resolve_metadata_lookup", lambda url: _lookup(url))
+
+    def fake_download(
+        url: str,
+        staging_dir: Path,
+        audio_format: str,
+        ffmpeg_threads=None,
+    ):
+        staging_dir.mkdir(parents=True, exist_ok=True)
+        path = staging_dir / f"{url}.m4a"
+        path.write_text("audio", encoding="utf-8")
+        return path
+
+    monkeypatch.setattr(pipeline, "download_track", fake_download)
+    monkeypatch.setattr(pipeline, "tag_file", lambda *args, **kwargs: True)
+    monkeypatch.setattr(
+        pipeline,
+        "import_to_apple_music",
+        lambda file_path, *args, **kwargs: _import_result(
+            f"Imported via Apple Music -> {file_path.name}",
+            final_path=file_path,
+        ),
+    )
+
+    pipeline.process_urls(
+        urls=["u1"],
+        dry_run=False,
+        config=config,
+        cache=cache,
+        jobs=1,
+        console=console,
+    )
+
+    assert cache.set_calls == [("u1", "downloaded")]
+    rendered = output.getvalue()
+    assert "Cached in_library entry no longer verified" in rendered
+    assert "1 downloaded & imported" in rendered
+
+
+def test_process_urls_retries_existing_file_when_cached_download_missing_from_music(
+    tmp_path, monkeypatch
+) -> None:
+    """Downloaded cache entries should retry Music.app import before redownloading."""
+    output = io.StringIO()
+    console = Console(file=output, force_terminal=False, color_system=None)
+    cache = FakeCache(
+        cached={
+            "u1": SimpleNamespace(
+                status="downloaded",
+                artist="Artist 1",
+                title="Track 1",
+            )
+        }
+    )
+    config = SimpleNamespace(
+        library_paths=[],
+        fuzzy_threshold=85,
+        staging_dir=tmp_path / "staging",
+        audio_format="m4a",
+        use_music_app=True,
+        import_destination=tmp_path / "library",
+    )
+    existing_file = (
+        config.import_destination / "Artist 1" / "Unknown Album" / "Track 1.m4a"
+    )
+    existing_file.parent.mkdir(parents=True, exist_ok=True)
+    existing_file.write_text("audio", encoding="utf-8")
+
+    monkeypatch.setattr(
+        pipeline,
+        "_build_checker",
+        lambda config, ctx: FakeChecker(set()),
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "resolve_metadata_lookup",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("metadata should not run")),
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "download_track",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("download should not run")),
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "retry_music_app_import",
+        lambda *args, **kwargs: _import_result(
+            f"Imported existing library file via Music.app -> {existing_file.name}",
+            final_path=existing_file,
+        ),
+    )
+
+    pipeline.process_urls(
+        urls=["u1"],
+        dry_run=False,
+        config=config,
+        cache=cache,
+        jobs=1,
+        console=console,
+    )
+
+    assert cache.set_calls == [("u1", "downloaded")]
+    rendered = output.getvalue()
+    assert "Imported existing library file via Music.app" in rendered
+    assert "1 downloaded & imported" in rendered
+
+
+def test_process_urls_does_not_skip_cached_download_on_fuzzy_only_library_match(
+    tmp_path, monkeypatch
+) -> None:
+    """Cache verification should require an exact current-library match."""
+    output = io.StringIO()
+    console = Console(file=output, force_terminal=False, color_system=None)
+    cache = FakeCache(
+        cached={
+            "u1": SimpleNamespace(
+                status="downloaded",
+                artist="Artist 1",
+                title="Track 1",
+            )
+        }
+    )
+    config = SimpleNamespace(
+        library_paths=[],
+        fuzzy_threshold=85,
+        staging_dir=tmp_path / "staging",
+        audio_format="m4a",
+        use_music_app=True,
+        import_destination=tmp_path / "library",
+    )
+    resolved_urls: list[str] = []
+
+    monkeypatch.setattr(
+        pipeline,
+        "_build_checker",
+        lambda config, ctx: FakeChecker({"u1"}, strict_in_library_urls=set()),
+    )
+
+    def fake_resolve(url: str):
+        resolved_urls.append(url)
+        return _lookup(url)
+
+    monkeypatch.setattr(pipeline, "resolve_metadata_lookup", fake_resolve)
+    monkeypatch.setattr(
+        pipeline,
+        "retry_music_app_import",
+        lambda *args, **kwargs: _import_result(
+            "No existing library file found for retry",
+            success=False,
+            music_app_imported=False,
+        ),
+    )
+
+    def fake_download(
+        url: str,
+        staging_dir: Path,
+        audio_format: str,
+        ffmpeg_threads=None,
+    ):
+        staging_dir.mkdir(parents=True, exist_ok=True)
+        path = staging_dir / f"{url}.m4a"
+        path.write_text("audio", encoding="utf-8")
+        return path
+
+    monkeypatch.setattr(pipeline, "download_track", fake_download)
+    monkeypatch.setattr(pipeline, "tag_file", lambda *args, **kwargs: True)
+    monkeypatch.setattr(
+        pipeline,
+        "import_to_apple_music",
+        lambda file_path, *args, **kwargs: _import_result(
+            f"Imported via Apple Music -> {file_path.name}",
+            final_path=file_path,
+        ),
+    )
+
+    pipeline.process_urls(
+        urls=["u1"],
+        dry_run=False,
+        config=config,
+        cache=cache,
+        jobs=1,
+        console=console,
+    )
+
+    assert resolved_urls == ["u1"]
+    assert cache.set_calls == [("u1", "downloaded")]
+    rendered = output.getvalue()
+    assert "missing from current library state" in rendered
+    assert "1 downloaded & imported" in rendered
+
+
+def test_process_urls_marks_music_app_notification_failure_as_pending_import(
+    tmp_path, monkeypatch
+) -> None:
+    """Move-only outcomes should stay retryable instead of claiming success."""
+    output = io.StringIO()
+    console = Console(file=output, force_terminal=False, color_system=None)
+    cache = FakeCache()
+    config = SimpleNamespace(
+        library_paths=[],
+        fuzzy_threshold=85,
+        staging_dir=tmp_path / "staging",
+        audio_format="m4a",
+        use_music_app=True,
+        import_destination=tmp_path / "library",
+    )
+
+    monkeypatch.setattr(
+        pipeline,
+        "_build_checker",
+        lambda config, ctx: FakeChecker(set()),
+    )
+    monkeypatch.setattr(pipeline, "resolve_metadata_lookup", lambda url: _lookup(url))
+
+    def fake_download(
+        url: str,
+        staging_dir: Path,
+        audio_format: str,
+        ffmpeg_threads=None,
+    ):
+        staging_dir.mkdir(parents=True, exist_ok=True)
+        path = staging_dir / f"{url}.m4a"
+        path.write_text("audio", encoding="utf-8")
+        return path
+
+    monkeypatch.setattr(pipeline, "download_track", fake_download)
+    monkeypatch.setattr(pipeline, "tag_file", lambda *args, **kwargs: True)
+    monkeypatch.setattr(
+        pipeline,
+        "import_to_apple_music",
+        lambda file_path, *args, **kwargs: _import_result(
+            f"In library folder (Music.app notification failed) -> {file_path.name}",
+            music_app_imported=False,
+            final_path=file_path,
+        ),
+    )
+
+    pipeline.process_urls(
+        urls=["u1"],
+        dry_run=False,
+        config=config,
+        cache=cache,
+        jobs=1,
+        console=console,
+    )
+
+    assert cache.set_calls == [("u1", "pending_import")]
+    rendered = output.getvalue()
+    assert "Music.app notification failed" in rendered
+    assert "1 failed" in rendered

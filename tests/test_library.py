@@ -79,3 +79,52 @@ def test_fuzzy_library_checker_title_only_match_stays_below_default_threshold(
     assert result.confidence == 70.0
     assert result.matched_track is None
     assert "will download" in result.reason
+
+
+def test_fuzzy_library_checker_does_not_collapse_versioned_titles(
+    monkeypatch,
+) -> None:
+    """Variant titles should not be treated as exact library hits."""
+    monkeypatch.setattr(
+        library,
+        "build_music_app_index",
+        lambda: [
+            library.Track(
+                path=Path("/"),
+                artist="Pendulum",
+                album="",
+                title="hold your colour",
+            )
+        ],
+    )
+    monkeypatch.setattr(library, "build_library_index", lambda *args, **kwargs: [])
+
+    checker = library.FuzzyLibraryChecker(Path("/tmp"), threshold=85)
+    result = checker.is_in_library("Pendulum", "Hold Your Colour (Noisia Remix)")
+    strict = checker.is_strictly_in_library("Pendulum", "Hold Your Colour (Noisia Remix)")
+
+    assert result.in_library is False
+    assert result.confidence < 85
+    assert strict.in_library is False
+
+
+def test_fuzzy_library_checker_strict_match_accepts_same_variant(
+    monkeypatch,
+) -> None:
+    """Strict cache verification should still accept the same exact variant."""
+    music_track = library.Track(
+        path=Path("/"),
+        artist="High Contrast",
+        album="",
+        title="days go by (2019 mix)",
+    )
+
+    monkeypatch.setattr(library, "build_music_app_index", lambda: [music_track])
+    monkeypatch.setattr(library, "build_library_index", lambda *args, **kwargs: [])
+
+    checker = library.FuzzyLibraryChecker(Path("/tmp"), threshold=85)
+    result = checker.is_strictly_in_library("High Contrast", "Days Go By (2019 Mix)")
+
+    assert result.in_library is True
+    assert result.matched_track == music_track
+    assert "Exact match" in result.reason

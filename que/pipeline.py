@@ -23,9 +23,9 @@ from rich.console import Console
 from rich.table import Table
 
 from .downloader import DownloadAttempt, download_track
-from .importer import import_to_apple_music
+from .importer import import_to_apple_music, retry_music_app_import
 from .library import FuzzyLibraryChecker
-from .resolver import TrackMeta, resolve_metadata
+from .resolver import MetadataLookup, TrackMeta, resolve_metadata_lookup
 from .tagger import tag_file
 
 WORKER_START_STAGGER_SECONDS = 0.35
@@ -187,6 +187,279 @@ def _plain_label(artist: str, title: str) -> str:
     return title or "—"
 
 
+def _metadata_failure_message(error: str | None) -> str:
+    """Return a user-facing metadata failure message.
+
+    Args:
+        error: Raw yt-dlp failure text, if available.
+
+    Returns:
+        Compact menu/CLI-friendly failure text.
+    """
+    normalized = (error or "").strip().lower()
+    if "not a bot" in normalized or "sign in to confirm" in normalized:
+        return "YouTube blocked metadata lookup — skipping"
+    if "cookies-from-browser" in normalized:
+        return "YouTube metadata needs browser cookies — skipping"
+    if normalized.startswith("timed out after"):
+        return "Metadata lookup timed out — skipping"
+    return "Could not fetch metadata — skipping"
+
+
+def _log_metadata_failure(
+    *,
+    ctx: RunContext,
+    index: int,
+    url: str,
+    lookup: MetadataLookup,
+) -> str:
+    """Emit a structured metadata-failure event and return its message.
+
+    Args:
+        ctx: Run logger/event emitter.
+        index: 1-based item index.
+        url: Canonical track URL.
+        lookup: Structured metadata lookup outcome.
+
+    Returns:
+        Final user-facing failure message.
+    """
+    message = _metadata_failure_message(lookup.error)
+    payload: dict[str, Any] = {
+        "index": index,
+        "url": url,
+    }
+    if lookup.error:
+        payload["reason"] = lookup.error
+    ctx.log(
+        f"  [red]✗  {message}[/red]",
+        event_type="metadata_failed",
+        **payload,
+    )
+    return message
+
+
+def _cache_note(status: str) -> str:
+    """Return user-facing note text for a cache hit."""
+    if status == "pending_import":
+        return "Cached previous result: pending_import"
+    return f"Cached previous result: {status}"
+
+
+def _make_cached_report(
+    index: int,
+    url: str,
+    cached: Any,
+    *,
+    item_started_at: str,
+    item_started_perf: float,
+    note: str | None = None,
+) -> TrackReport:
+    """Build the stable report shape for a cache short-circuit."""
+    return _make_report(
+        index=index,
+        url=url,
+        status="cached",
+        artist=cached.artist,
+        title=cached.title,
+        note=note or _cache_note(cached.status),
+        started_at=item_started_at,
+        committed_at=_now_iso(),
+        total_item_seconds=perf_counter() - item_started_perf,
+    )
+
+
+def _verify_cached_library_state(checker: Any, artist: str, title: str) -> Any:
+    """Prefer strict current-library verification for cache revalidation."""
+    strict_check = getattr(checker, "is_strictly_in_library", None)
+    if callable(strict_check):
+        return strict_check(artist, title)
+    return checker.is_in_library(artist, title)
+
+
+def _maybe_use_cached_entry(
+    *,
+    index: int,
+    url: str,
+    cached: Any,
+    checker: Any,
+    config: Any,
+    cache: Any,
+    stats: dict[str, int],
+    ctx: RunContext,
+    item_started_at: str,
+    item_started_perf: float,
+    playlist_name: str | None,
+    skip_library_urls: set[str] | None = None,
+) -> TrackReport | None:
+    """Return a cache-backed or recovered report when the entry is still trustworthy."""
+    label = _label(cached.artist, cached.title)
+    if cached.status in {"failed", "skipped"}:
+        # Reason: neither a failed attempt nor a dry-run skip proves durable
+        # state. Reuse them for history, not for future short-circuiting.
+        ctx.log(
+            "  [yellow]↻ Cached "
+            f"{cached.status} entry is retryable; continuing[/yellow]",
+            event_type="cache_retryable",
+            index=index,
+            url=url,
+            cached_status=cached.status,
+        )
+        return None
+
+    if cached.status == "in_library":
+        if not cached.title:
+            ctx.log(
+                "  [yellow]↻ Cached in_library entry missing metadata; continuing[/yellow]",
+                event_type="cache_stale",
+                index=index,
+                url=url,
+                cached_status=cached.status,
+            )
+            return None
+
+        result = _verify_cached_library_state(checker, cached.artist, cached.title)
+        if result.in_library:
+            ctx.log(
+                f"  ⏭  [dim]Cached ({cached.status}, verified):[/dim] {label}",
+                event_type="cache_hit",
+                index=index,
+                url=url,
+                status=cached.status,
+                verification="verified",
+            )
+            stats["cached"] += 1
+            return _make_cached_report(
+                index=index,
+                url=url,
+                cached=cached,
+                item_started_at=item_started_at,
+                item_started_perf=item_started_perf,
+                note=f"{_cache_note(cached.status)}; verified against current library",
+            )
+
+        ctx.log(
+            "  [yellow]↻ Cached in_library entry no longer verified; continuing[/yellow]",
+            event_type="cache_stale",
+            index=index,
+            url=url,
+            cached_status=cached.status,
+            reason=result.reason,
+        )
+        if skip_library_urls is not None:
+            skip_library_urls.add(url)
+        return None
+
+    if cached.status in {"downloaded", "pending_import"} and config.use_music_app:
+        if not cached.title:
+            ctx.log(
+                f"  [yellow]↻ Cached {cached.status} entry missing metadata; continuing[/yellow]",
+                event_type="cache_stale",
+                index=index,
+                url=url,
+                cached_status=cached.status,
+            )
+            return None
+
+        result = _verify_cached_library_state(checker, cached.artist, cached.title)
+        if result.in_library:
+            ctx.log(
+                f"  ⏭  [dim]Cached ({cached.status}, verified):[/dim] {label}",
+                event_type="cache_hit",
+                index=index,
+                url=url,
+                status=cached.status,
+                verification="verified",
+            )
+            stats["cached"] += 1
+            return _make_cached_report(
+                index=index,
+                url=url,
+                cached=cached,
+                item_started_at=item_started_at,
+                item_started_perf=item_started_perf,
+                note=f"{_cache_note(cached.status)}; verified against current library",
+            )
+
+        recovery = retry_music_app_import(
+            config.import_destination,
+            cached.artist,
+            cached.title,
+            playlist_name=playlist_name,
+        )
+        if recovery.success:
+            ctx.log(
+                f"  [green]↻  {recovery.message}[/green]",
+                event_type="cache_recovered_import",
+                index=index,
+                url=url,
+            )
+            cache.set(url, cached.title, cached.artist, "downloaded")
+            stats["downloaded"] += 1
+            return _make_report(
+                index=index,
+                url=url,
+                status="downloaded",
+                artist=cached.artist,
+                title=cached.title,
+                note=recovery.message,
+                started_at=item_started_at,
+                committed_at=_now_iso(),
+                total_item_seconds=perf_counter() - item_started_perf,
+            )
+
+        if recovery.final_path is not None:
+            ctx.log(
+                f"  [red]✗  {recovery.message}[/red]",
+                event_type="cache_recovery_failed",
+                index=index,
+                url=url,
+            )
+            cache.set(url, cached.title, cached.artist, "pending_import")
+            stats["failed"] += 1
+            return _make_report(
+                index=index,
+                url=url,
+                status="failed",
+                artist=cached.artist,
+                title=cached.title,
+                note=recovery.message,
+                started_at=item_started_at,
+                committed_at=_now_iso(),
+                total_item_seconds=perf_counter() - item_started_perf,
+                failure_stage="import",
+            )
+
+        ctx.log(
+            "  [yellow]↻ Cached "
+            f"{cached.status} entry missing from current library state; continuing[/yellow]",
+            event_type="cache_stale",
+            index=index,
+            url=url,
+            cached_status=cached.status,
+            reason=result.reason,
+        )
+        if skip_library_urls is not None:
+            skip_library_urls.add(url)
+        return None
+
+    ctx.log(
+        f"  ⏭  [dim]Cached ({cached.status}):[/dim] {label}",
+        event_type="cache_hit",
+        index=index,
+        url=url,
+        status=cached.status,
+    )
+    stats["cached"] += 1
+    return _make_cached_report(
+        index=index,
+        url=url,
+        cached=cached,
+        item_started_at=item_started_at,
+        item_started_perf=item_started_perf,
+    )
+
+
 def _emit_item_report(ctx: RunContext, report: TrackReport) -> None:
     """Emit the finalized report for one item."""
     ctx.emit("item_report", report=asdict(report))
@@ -295,6 +568,7 @@ def _preflight(
     config: Any,
     cache: Any,
     ctx: RunContext,
+    playlist_name: str | None,
 ) -> tuple[list[DownloadTask], dict[int, TrackReport], dict[str, int]]:
     """Run metadata/cache/library checks in input order."""
     checker = None if benchmark else _build_checker(config, ctx)
@@ -309,6 +583,7 @@ def _preflight(
         "cached": 0,
         "skipped": 0,
     }
+    skip_library_urls: set[str] = set()
 
     for index, url in enumerate(urls, 1):
         item_started_at = _now_iso()
@@ -323,28 +598,24 @@ def _preflight(
 
         cached = None if benchmark else cache.get(url)
         if cached:
-            ctx.log(
-                f"  ⏭  [dim]Cached ({cached.status}):[/dim] "
-                f"{_label(cached.artist, cached.title)}",
-                event_type="cache_hit",
+            cached_report = _maybe_use_cached_entry(
                 index=index,
                 url=url,
-                status=cached.status,
+                cached=cached,
+                checker=checker,
+                config=config,
+                cache=cache,
+                stats=stats,
+                ctx=ctx,
+                item_started_at=item_started_at,
+                item_started_perf=item_started_perf,
+                playlist_name=playlist_name,
+                skip_library_urls=skip_library_urls,
             )
-            stats["cached"] += 1
-            reports[index] = _make_report(
-                index=index,
-                url=url,
-                status="cached",
-                artist=cached.artist,
-                title=cached.title,
-                note=f"Cached previous result: {cached.status}",
-                started_at=item_started_at,
-                committed_at=_now_iso(),
-                total_item_seconds=perf_counter() - item_started_perf,
-            )
-            _emit_item_report(ctx, reports[index])
-            continue
+            if cached_report is not None:
+                reports[index] = cached_report
+                _emit_item_report(ctx, reports[index])
+                continue
 
         if benchmark:
             meta = TrackMeta(
@@ -355,15 +626,22 @@ def _preflight(
             )
         else:
             with ctx.status("  Fetching metadata…"):
-                meta = resolve_metadata(url)
+                lookup = resolve_metadata_lookup(url)
+            meta = lookup.meta
+            if lookup.used_browser_cookies:
+                ctx.log(
+                    "  [yellow]↻ Metadata lookup required browser cookies[/yellow]",
+                    event_type="metadata_cookie_retry",
+                    index=index,
+                    url=url,
+                )
 
         if not meta:
-            message = "Could not fetch metadata — skipping"
-            ctx.log(
-                f"  [red]✗  {message}[/red]",
-                event_type="metadata_failed",
+            message = _log_metadata_failure(
+                ctx=ctx,
                 index=index,
                 url=url,
+                lookup=lookup,
             )
             if not benchmark:
                 cache.set(url, "", "", "failed")
@@ -401,35 +679,44 @@ def _preflight(
             )
 
         if not benchmark and checker is not None:
-            result = checker.is_in_library(meta.artist, meta.title)
-            if result.in_library:
-                note = f"Already in library — {result.reason}"
+            if url in skip_library_urls:
                 ctx.log(
-                    f"  [cyan]✓  Already in library[/cyan]  [dim]{result.reason}[/dim]"
-                )
-                cache.set(url, meta.title, meta.artist, "in_library")
-                stats["in_library"] += 1
-                reports[index] = _make_report(
+                    "  [yellow]↻ Exact cache verification failed; bypassing fuzzy "
+                    "library skip for this URL[/yellow]",
+                    event_type="library_bypass_cached_miss",
                     index=index,
                     url=url,
-                    status="in_library",
-                    artist=meta.artist,
-                    title=meta.title,
-                    note=note,
-                    started_at=item_started_at,
-                    committed_at=_now_iso(),
-                    total_item_seconds=perf_counter() - item_started_perf,
                 )
-                _emit_item_report(ctx, reports[index])
-                continue
+            else:
+                result = checker.is_in_library(meta.artist, meta.title)
+                if result.in_library:
+                    note = f"Already in library — {result.reason}"
+                    ctx.log(
+                        f"  [cyan]✓  Already in library[/cyan]  [dim]{result.reason}[/dim]"
+                    )
+                    cache.set(url, meta.title, meta.artist, "in_library")
+                    stats["in_library"] += 1
+                    reports[index] = _make_report(
+                        index=index,
+                        url=url,
+                        status="in_library",
+                        artist=meta.artist,
+                        title=meta.title,
+                        note=note,
+                        started_at=item_started_at,
+                        committed_at=_now_iso(),
+                        total_item_seconds=perf_counter() - item_started_perf,
+                    )
+                    _emit_item_report(ctx, reports[index])
+                    continue
 
-            ctx.log(
-                f"  [yellow]↓  Not in library[/yellow]  [dim]{result.reason}[/dim]",
-                event_type="library_miss",
-                index=index,
-                url=url,
-                reason=result.reason,
-            )
+                ctx.log(
+                    f"  [yellow]↓  Not in library[/yellow]  [dim]{result.reason}[/dim]",
+                    event_type="library_miss",
+                    index=index,
+                    url=url,
+                    reason=result.reason,
+                )
         elif benchmark:
             ctx.log(
                 "  [blue]≈  Benchmark mode[/blue]  [dim]cache/library bypassed[/dim]",
@@ -576,6 +863,7 @@ def _process_urls_serial(
         "cached": 0,
         "skipped": 0,
     }
+    skip_library_urls: set[str] = set()
 
     for index, url in enumerate(urls, 1):
         item_started_at = _now_iso()
@@ -590,39 +878,42 @@ def _process_urls_serial(
 
         cached = cache.get(url)
         if cached:
-            ctx.log(
-                f"  ⏭  [dim]Cached ({cached.status}):[/dim] "
-                f"{_label(cached.artist, cached.title)}",
-                event_type="cache_hit",
+            cached_report = _maybe_use_cached_entry(
                 index=index,
                 url=url,
-                status=cached.status,
+                cached=cached,
+                checker=checker,
+                config=config,
+                cache=cache,
+                stats=stats,
+                ctx=ctx,
+                item_started_at=item_started_at,
+                item_started_perf=item_started_perf,
+                playlist_name=playlist_name,
+                skip_library_urls=skip_library_urls,
             )
-            stats["cached"] += 1
-            reports[index] = _make_report(
-                index=index,
-                url=url,
-                status="cached",
-                artist=cached.artist,
-                title=cached.title,
-                note=f"Cached previous result: {cached.status}",
-                started_at=item_started_at,
-                committed_at=_now_iso(),
-                total_item_seconds=perf_counter() - item_started_perf,
-            )
-            _emit_item_report(ctx, reports[index])
-            continue
+            if cached_report is not None:
+                reports[index] = cached_report
+                _emit_item_report(ctx, reports[index])
+                continue
 
         with ctx.status("  Fetching metadata…"):
-            meta = resolve_metadata(url)
-
-        if not meta:
-            message = "Could not fetch metadata — skipping"
+            lookup = resolve_metadata_lookup(url)
+        meta = lookup.meta
+        if lookup.used_browser_cookies:
             ctx.log(
-                f"  [red]✗  {message}[/red]",
-                event_type="metadata_failed",
+                "  [yellow]↻ Metadata lookup required browser cookies[/yellow]",
+                event_type="metadata_cookie_retry",
                 index=index,
                 url=url,
+            )
+
+        if not meta:
+            message = _log_metadata_failure(
+                ctx=ctx,
+                index=index,
+                url=url,
+                lookup=lookup,
             )
             cache.set(url, "", "", "failed")
             stats["failed"] += 1
@@ -658,39 +949,48 @@ def _process_urls_serial(
                 raw_title=meta.raw_title,
             )
 
-        result = checker.is_in_library(meta.artist, meta.title)
-        if result.in_library:
-            note = f"Already in library — {result.reason}"
+        if url in skip_library_urls:
             ctx.log(
-                f"  [cyan]✓  Already in library[/cyan]  [dim]{result.reason}[/dim]",
-                event_type="library_hit",
+                "  [yellow]↻ Exact cache verification failed; bypassing fuzzy "
+                "library skip for this URL[/yellow]",
+                event_type="library_bypass_cached_miss",
+                index=index,
+                url=url,
+            )
+        else:
+            result = checker.is_in_library(meta.artist, meta.title)
+            if result.in_library:
+                note = f"Already in library — {result.reason}"
+                ctx.log(
+                    f"  [cyan]✓  Already in library[/cyan]  [dim]{result.reason}[/dim]",
+                    event_type="library_hit",
+                    index=index,
+                    url=url,
+                    reason=result.reason,
+                )
+                cache.set(url, meta.title, meta.artist, "in_library")
+                stats["in_library"] += 1
+                reports[index] = _make_report(
+                    index=index,
+                    url=url,
+                    status="in_library",
+                    artist=meta.artist,
+                    title=meta.title,
+                    note=note,
+                    started_at=item_started_at,
+                    committed_at=_now_iso(),
+                    total_item_seconds=perf_counter() - item_started_perf,
+                )
+                _emit_item_report(ctx, reports[index])
+                continue
+
+            ctx.log(
+                f"  [yellow]↓  Not in library[/yellow]  [dim]{result.reason}[/dim]",
+                event_type="library_miss",
                 index=index,
                 url=url,
                 reason=result.reason,
             )
-            cache.set(url, meta.title, meta.artist, "in_library")
-            stats["in_library"] += 1
-            reports[index] = _make_report(
-                index=index,
-                url=url,
-                status="in_library",
-                artist=meta.artist,
-                title=meta.title,
-                note=note,
-                started_at=item_started_at,
-                committed_at=_now_iso(),
-                total_item_seconds=perf_counter() - item_started_perf,
-            )
-            _emit_item_report(ctx, reports[index])
-            continue
-
-        ctx.log(
-            f"  [yellow]↓  Not in library[/yellow]  [dim]{result.reason}[/dim]",
-            event_type="library_miss",
-            index=index,
-            url=url,
-            reason=result.reason,
-        )
         if dry_run:
             ctx.log(
                 "  [dim][dry-run] Would download[/dim]",
@@ -779,7 +1079,7 @@ def _process_urls_serial(
             )
 
         import_start = perf_counter()
-        ok, message = import_to_apple_music(
+        import_result = import_to_apple_music(
             downloaded_path,
             meta.artist,
             config.import_destination,
@@ -788,12 +1088,14 @@ def _process_urls_serial(
         )
         import_seconds = perf_counter() - import_start
         committed_at = _now_iso()
-        note = message if not tagged else f"{message}; tagged metadata"
+        note = import_result.message if not tagged else f"{import_result.message}; tagged metadata"
         total_item_seconds = perf_counter() - item_started_perf
 
-        if ok:
+        if import_result.success and (
+            import_result.music_app_imported or not config.use_music_app
+        ):
             ctx.log(
-                f"  [green]✓  {message}[/green]",
+                f"  [green]✓  {import_result.message}[/green]",
                 event_type="import_completed",
                 index=index,
                 url=url,
@@ -821,8 +1123,39 @@ def _process_urls_serial(
             _emit_item_report(ctx, reports[index])
             continue
 
+        if import_result.success:
+            ctx.log(
+                f"  [red]✗  {import_result.message}[/red]",
+                event_type="import_failed",
+                index=index,
+                url=url,
+            )
+            cache.set(url, meta.title, meta.artist, "pending_import")
+            stats["failed"] += 1
+            reports[index] = _make_report(
+                index=index,
+                url=url,
+                status="failed",
+                artist=meta.artist,
+                title=meta.title,
+                note=note,
+                started_at=item_started_at,
+                download_started_at=download_started_at,
+                download_finished_at=download_finished_at,
+                committed_at=committed_at,
+                download_seconds=download_seconds,
+                tag_seconds=tag_seconds,
+                import_seconds=import_seconds,
+                total_item_seconds=total_item_seconds,
+                file_size_bytes=file_size_bytes,
+                download_bytes_per_second=_safe_rate(file_size_bytes, download_seconds),
+                failure_stage="import",
+            )
+            _emit_item_report(ctx, reports[index])
+            continue
+
         ctx.log(
-            f"  [red]✗  {message}[/red]",
+            f"  [red]✗  {import_result.message}[/red]",
             event_type="import_failed",
             index=index,
             url=url,
@@ -835,7 +1168,7 @@ def _process_urls_serial(
             status="failed",
             artist=meta.artist,
             title=meta.title,
-            note=message,
+            note=import_result.message,
             started_at=item_started_at,
             download_started_at=download_started_at,
             download_finished_at=download_finished_at,
@@ -924,7 +1257,7 @@ def _commit_download_result(
     tag_seconds = perf_counter() - tag_start
 
     import_start = perf_counter()
-    ok, message = import_to_apple_music(
+    import_result = import_to_apple_music(
         result.downloaded_path,
         result.meta.artist,
         config.import_destination,
@@ -934,12 +1267,14 @@ def _commit_download_result(
     import_seconds = perf_counter() - import_start
     _cleanup_staging_dir(result.staging_dir)
 
-    note = message
+    note = import_result.message
     if tagged:
-        note = f"{message}; tagged metadata"
+        note = f"{import_result.message}; tagged metadata"
 
     total_item_seconds = perf_counter() - result.item_started_perf
-    if ok:
+    if import_result.success and (
+        import_result.music_app_imported or not config.use_music_app
+    ):
         cache.set(result.url, result.meta.title, result.meta.artist, "downloaded")
         stats["downloaded"] += 1
         return _make_report(
@@ -967,6 +1302,35 @@ def _commit_download_result(
             worker_name=result.worker_name,
         )
 
+    if import_result.success:
+        cache.set(result.url, result.meta.title, result.meta.artist, "pending_import")
+        stats["failed"] += 1
+        return _make_report(
+            index=result.index,
+            url=result.url,
+            status="failed",
+            artist=result.meta.artist,
+            title=result.meta.title,
+            note=note,
+            started_at=result.item_started_at,
+            queued_at=result.queued_at,
+            download_started_at=result.started_at,
+            download_finished_at=result.finished_at,
+            committed_at=committed_at,
+            queue_wait_seconds=result.queue_wait_seconds,
+            download_seconds=result.download_seconds,
+            tag_seconds=tag_seconds,
+            import_seconds=import_seconds,
+            total_item_seconds=total_item_seconds,
+            file_size_bytes=result.file_size_bytes,
+            download_bytes_per_second=_safe_rate(
+                result.file_size_bytes,
+                result.download_seconds,
+            ),
+            failure_stage="import",
+            worker_name=result.worker_name,
+        )
+
     cache.set(result.url, result.meta.title, result.meta.artist, "failed")
     stats["failed"] += 1
     return _make_report(
@@ -975,7 +1339,7 @@ def _commit_download_result(
         status="failed",
         artist=result.meta.artist,
         title=result.meta.title,
-        note=message,
+        note=import_result.message,
         started_at=result.item_started_at,
         queued_at=result.queued_at,
         download_started_at=result.started_at,
@@ -1330,6 +1694,7 @@ def process_urls(
                 config=config,
                 cache=cache,
                 ctx=ctx,
+                playlist_name=playlist_name,
             )
             preflight_seconds = perf_counter() - run_started_perf
             queued_downloads = len(download_tasks)

@@ -1,6 +1,4 @@
-"""
-resolver.py — fetches track metadata (artist, title) via yt-dlp
-without downloading the actual audio, and expands playlist URLs.
+"""Resolve media metadata and playlist members for `que`.
 
 YouTube titles often look like:
   "Artist - Title (Official Video)"
@@ -19,7 +17,9 @@ from __future__ import annotations
 import re
 import subprocess
 from dataclasses import dataclass
-from typing import Optional
+
+from .intake import classify_target_kind, normalize_url, target_from_url
+from .yt_dlp_env import run_yt_dlp
 
 # Matches "Artist - Title", "Artist – Title", "Artist — Title"
 _SPLIT_RE = re.compile(r"^(.+?)\s*[-\u2013\u2014]\s*(.+)$")
@@ -81,71 +81,160 @@ def _parse_artist_title(
 
 @dataclass
 class TrackMeta:
+    """Structured artist/title metadata for one resolved track."""
+
     url: str
     title: str
     artist: str
     raw_title: str  # original title string from yt-dlp, kept for debugging
 
 
-def resolve_metadata(url: str, timeout: int = 30) -> Optional[TrackMeta]:
+@dataclass(frozen=True)
+class MetadataLookup:
+    """Outcome of one metadata resolution attempt.
+
+    Attributes:
+        meta: Resolved metadata when lookup succeeded.
+        error: Last yt-dlp failure text when lookup failed.
+        used_browser_cookies: True when the successful lookup needed Chrome cookies.
     """
-    Query yt-dlp for track metadata without downloading.
-    Returns None if the URL is unavailable or yt-dlp fails.
+
+    meta: TrackMeta | None
+    error: str | None = None
+    used_browser_cookies: bool = False
+
+
+def resolve_metadata_lookup(url: str, timeout: int = 30) -> MetadataLookup:
+    """Resolve track metadata, retrying harder YouTube cases with browser cookies.
+
+    Args:
+        url: Canonical media URL.
+        timeout: yt-dlp subprocess timeout in seconds.
+
+    Returns:
+        Structured lookup result with optional metadata and failure detail.
+    """
+    meta, error = _resolve_metadata_once(url, timeout=timeout, use_browser_cookies=False)
+    if meta is not None:
+        return MetadataLookup(meta=meta, error=None, used_browser_cookies=False)
+
+    if target_from_url(url).source != "youtube":
+        return MetadataLookup(meta=None, error=error, used_browser_cookies=False)
+
+    retry_meta, retry_error = _resolve_metadata_once(
+        url,
+        timeout=timeout,
+        use_browser_cookies=True,
+    )
+    if retry_meta is not None:
+        return MetadataLookup(meta=retry_meta, error=None, used_browser_cookies=True)
+
+    if retry_error and error and retry_error != error:
+        error = f"{error}; cookie retry: {retry_error}"
+    else:
+        error = retry_error or error
+    return MetadataLookup(meta=None, error=error, used_browser_cookies=False)
+
+
+def resolve_metadata(url: str, timeout: int = 30) -> TrackMeta | None:
+    """Resolve track metadata only.
+
+    Args:
+        url: Canonical media URL.
+        timeout: yt-dlp subprocess timeout in seconds.
+
+    Returns:
+        Parsed metadata, or `None` when resolution fails.
+    """
+    return resolve_metadata_lookup(url, timeout=timeout).meta
+
+
+def _resolve_metadata_once(
+    url: str,
+    *,
+    timeout: int,
+    use_browser_cookies: bool,
+) -> tuple[TrackMeta | None, str | None]:
+    """Run one yt-dlp metadata command.
+
+    Args:
+        url: Canonical media URL.
+        timeout: yt-dlp subprocess timeout in seconds.
+        use_browser_cookies: Whether to pass Chrome cookies to yt-dlp.
+
+    Returns:
+        Tuple of `(metadata, error_text)`.
     """
     try:
-        result = subprocess.run(
-            [
-                "yt-dlp",
-                "--print", "%(artist)s|||%(title)s|||%(uploader)s",
-                "--no-download",
-                "--no-playlist",
-                "--quiet",
-                "--no-warnings",
-                url,
-            ],
-            capture_output=True,
-            text=True,
+        result = run_yt_dlp(
+            _metadata_command(url, use_browser_cookies=use_browser_cookies),
             timeout=timeout,
         )
 
         if result.returncode != 0:
-            return None
+            return None, _metadata_error_text(result)
 
         line = result.stdout.strip().splitlines()[0] if result.stdout.strip() else ""
         parts = line.split("|||")
         if len(parts) < 2:
-            return None
+            return None, "yt-dlp returned incomplete metadata"
 
         artist_field = parts[0].strip() if parts[0].strip() != "NA" else ""
         raw_title = parts[1].strip() if len(parts) > 1 else ""
         uploader = parts[2].strip() if len(parts) > 2 else ""
 
         if not raw_title:
-            return None
+            return None, "yt-dlp returned no title"
 
         artist, title = _parse_artist_title(raw_title, artist_field, uploader)
 
-        return TrackMeta(
-            url=url,
-            title=title,
-            artist=artist,
-            raw_title=raw_title,
+        return (
+            TrackMeta(
+                url=url,
+                title=title,
+                artist=artist,
+                raw_title=raw_title,
+            ),
+            None,
         )
 
     except subprocess.TimeoutExpired:
-        return None
-    except Exception:
-        return None
+        return None, f"Timed out after {timeout}s"
+    except Exception as exc:
+        return None, str(exc)
+
+
+def _metadata_command(url: str, *, use_browser_cookies: bool) -> list[str]:
+    """Return the yt-dlp metadata command for one lookup."""
+    command = [
+        "yt-dlp",
+        "--print",
+        "%(artist)s|||%(title)s|||%(uploader)s",
+        "--no-download",
+        "--no-playlist",
+        "--quiet",
+        "--no-warnings",
+    ]
+    if use_browser_cookies:
+        command.extend(["--cookies-from-browser", "chrome"])
+    command.append(url)
+    return command
+
+
+def _metadata_error_text(result: subprocess.CompletedProcess[str]) -> str:
+    """Extract a compact error message from a failed yt-dlp process."""
+    stderr = result.stderr.strip()
+    if stderr:
+        return stderr.splitlines()[-1]
+    return f"yt-dlp exited {result.returncode}"
 
 
 # ── Playlist expansion ────────────────────────────────────────────────────────
 
-_PLAYLIST_RE = re.compile(r"[?&]list=|/playlist\?", re.IGNORECASE)
-
-
 def is_playlist_url(url: str) -> bool:
-    """Return True if the URL points to a YouTube (or similar) playlist."""
-    return bool(_PLAYLIST_RE.search(url))
+    """Return True only for explicit playlist targets."""
+    normalized = normalize_url(url)
+    return classify_target_kind(normalized, source="youtube") == "playlist"
 
 
 def expand_playlist(url: str, timeout: int = 60) -> list[str]:
@@ -157,17 +246,16 @@ def expand_playlist(url: str, timeout: int = 60) -> list[str]:
     Falls back to [url] (treating it as a single track) if expansion fails.
     """
     try:
-        result = subprocess.run(
+        result = run_yt_dlp(
             [
                 "yt-dlp",
                 "--flat-playlist",
-                "--print", "url",
+                "--print",
+                "url",
                 "--quiet",
                 "--no-warnings",
                 url,
             ],
-            capture_output=True,
-            text=True,
             timeout=timeout,
         )
         if result.returncode != 0:

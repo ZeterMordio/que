@@ -11,6 +11,8 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
+from .yt_dlp_env import run_yt_dlp
+
 _AUDIO_EXTS = {".m4a", ".mp3", ".flac", ".aac", ".ogg", ".wav", ".aiff", ".aif"}
 
 
@@ -76,12 +78,7 @@ def _build_command(
 
 def _run_command(command: list[str], timeout: int) -> tuple[int, str]:
     """Run yt-dlp and return `(returncode, stderr_message)`."""
-    result = subprocess.run(
-        command,
-        capture_output=True,
-        text=True,
-        timeout=timeout,
-    )
+    result = run_yt_dlp(command, timeout=timeout)
     if result.returncode == 0:
         return 0, ""
     stderr = result.stderr.strip()

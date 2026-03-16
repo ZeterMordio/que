@@ -38,7 +38,7 @@ import re
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional, Protocol, runtime_checkable
+from typing import Protocol, runtime_checkable
 
 from rapidfuzz import fuzz
 
@@ -58,7 +58,7 @@ class Track:
 class CheckResult:
     in_library: bool
     confidence: float       # 0–100
-    matched_track: Optional[Track]
+    matched_track: Track | None
     reason: str
 
 
@@ -80,6 +80,30 @@ _TRACK_NUM_RE = re.compile(r"^\d{1,3}[\s\.\-]+")   # "01 ", "02 - ", "3. "
 _EXT_RE = re.compile(r"\.(m4a|mp3|flac|aac|ogg|wav|aiff?)$", re.IGNORECASE)
 _FEAT_RE = re.compile(r"\s*[\(\[](feat|ft)\.?\s+[^\)\]]+[\)\]]", re.IGNORECASE)
 _PARENS_RE = re.compile(r"\s*[\(\[][^\)\]]*[\)\]]")  # generic (...)
+_PARENS_CONTENT_RE = re.compile(r"[\(\[]([^\)\]]+)[\)\]]")
+_NON_ALNUM_RE = re.compile(r"[^a-z0-9]+")
+_VERSION_TOKENS = {
+    "acoustic",
+    "bootleg",
+    "club",
+    "demo",
+    "dub",
+    "dubstep",
+    "drumstep",
+    "edit",
+    "extended",
+    "instrumental",
+    "live",
+    "mashup",
+    "mix",
+    "original",
+    "radio",
+    "remaster",
+    "remix",
+    "rework",
+    "version",
+    "vip",
+}
 
 
 def _normalize(s: str) -> str:
@@ -97,6 +121,68 @@ def _normalize_title_aggressive(s: str) -> str:
     return s.strip()
 
 
+def _canonical_match_text(s: str) -> str:
+    """Normalize text for exact-ish equality checks without dropping version info."""
+    s = _normalize(s).replace("&", " and ")
+    return _NON_ALNUM_RE.sub(" ", s).strip()
+
+
+def _extract_variant_chunks(s: str) -> list[str]:
+    """Return normalized parenthetical/bracketed variant chunks."""
+    chunks: list[str] = []
+    for raw in _PARENS_CONTENT_RE.findall(s):
+        chunk = _canonical_match_text(raw)
+        if chunk:
+            chunks.append(chunk)
+    return chunks
+
+
+def _extract_version_tokens(s: str) -> set[str]:
+    """Return version-indicating tokens from a title."""
+    return {
+        token
+        for token in _canonical_match_text(s).split()
+        if token in _VERSION_TOKENS
+    }
+
+
+def _score_title_match(query_title: str, candidate_title: str) -> float:
+    """Score title similarity while rejecting remix/version false positives."""
+    query_text = _canonical_match_text(query_title)
+    candidate_text = _canonical_match_text(candidate_title)
+    base_score = max(
+        fuzz.ratio(query_text, candidate_text),
+        fuzz.token_sort_ratio(query_text, candidate_text),
+    )
+
+    query_chunks = _extract_variant_chunks(query_title)
+    candidate_chunks = _extract_variant_chunks(candidate_title)
+    if query_chunks or candidate_chunks:
+        if not query_chunks or not candidate_chunks:
+            return min(base_score, 70.0)
+        qualifier_score = fuzz.token_sort_ratio(
+            " ".join(query_chunks),
+            " ".join(candidate_chunks),
+        )
+        if qualifier_score < 75:
+            return min(base_score, 70.0)
+
+    query_versions = _extract_version_tokens(query_title)
+    candidate_versions = _extract_version_tokens(candidate_title)
+    if query_versions or candidate_versions:
+        if query_versions != candidate_versions:
+            if not query_versions or not candidate_versions:
+                return min(base_score, 70.0)
+            version_score = fuzz.token_sort_ratio(
+                " ".join(sorted(query_versions)),
+                " ".join(sorted(candidate_versions)),
+            )
+            if version_score < 75:
+                return min(base_score, 70.0)
+
+    return base_score
+
+
 # ---------------------------------------------------------------------------
 # Library indexing
 # ---------------------------------------------------------------------------
@@ -104,7 +190,7 @@ def _normalize_title_aggressive(s: str) -> str:
 _AUDIO_EXTS = {".m4a", ".mp3", ".flac", ".aac", ".ogg", ".wav", ".aiff", ".aif"}
 
 
-def _index_one_path(library_path: Path) -> List[Track]:
+def _index_one_path(library_path: Path) -> list[Track]:
     """
     Walk a single directory and return Track objects.
 
@@ -113,7 +199,7 @@ def _index_one_path(library_path: Path) -> List[Track]:
       Flat:        <root>/<track.m4a>                    → artist/album left empty,
                                                            title-only matching applies
     """
-    tracks: List[Track] = []
+    tracks: list[Track] = []
     if not library_path.exists():
         return tracks
 
@@ -136,7 +222,7 @@ def _index_one_path(library_path: Path) -> List[Track]:
     return tracks
 
 
-def build_music_app_index() -> List[Track]:
+def build_music_app_index() -> list[Track]:
     """
     Query Music.app via osascript (JXA) for the complete track list.
 
@@ -182,7 +268,7 @@ def build_music_app_index() -> List[Track]:
         return []
 
 
-def build_library_index(library_paths: "List[Path] | Path") -> List[Track]:
+def build_library_index(library_paths: list[Path] | Path) -> list[Track]:
     """
     Build a unified track index from one or more library roots.
     Accepts either a single Path or a list of Paths.
@@ -190,7 +276,7 @@ def build_library_index(library_paths: "List[Path] | Path") -> List[Track]:
     if isinstance(library_paths, Path):
         library_paths = [library_paths]
 
-    tracks: List[Track] = []
+    tracks: list[Track] = []
     for p in library_paths:
         tracks.extend(_index_one_path(p))
     return tracks
@@ -213,7 +299,7 @@ class FuzzyLibraryChecker:
         "already in library".  Default 85 — err on the side of downloading.
     """
 
-    def __init__(self, library_paths: "List[Path] | Path", threshold: int = 85):
+    def __init__(self, library_paths: list[Path] | Path, threshold: int = 85):
         self.threshold = threshold
         # Try Music.app first — it's the definitive source of truth.
         # Fall back to filesystem scanning if Music.app is unavailable.
@@ -225,6 +311,58 @@ class FuzzyLibraryChecker:
             self._tracks = build_library_index(library_paths)
             self._source = "filesystem"
 
+    def is_strictly_in_library(self, artist: str, title: str) -> CheckResult:
+        """Return only exact current-library matches for cache verification."""
+        if not self._tracks:
+            return CheckResult(
+                in_library=False,
+                confidence=0.0,
+                matched_track=None,
+                reason="Library is empty or path not found — will continue",
+            )
+
+        norm_title = _canonical_match_text(title)
+        norm_artist = _canonical_match_text(artist)
+        title_only_match: Track | None = None
+
+        for track in self._tracks:
+            if _canonical_match_text(track.title) != norm_title:
+                continue
+            if not norm_artist:
+                return CheckResult(
+                    in_library=True,
+                    confidence=100.0,
+                    matched_track=track,
+                    reason=f"Exact title match '{track.title}'",
+                )
+
+            track_artist = _canonical_match_text(track.artist)
+            if track_artist == norm_artist:
+                return CheckResult(
+                    in_library=True,
+                    confidence=100.0,
+                    matched_track=track,
+                    reason=f"Exact match '{track.artist} – {track.title}'",
+                )
+
+            if not track_artist and title_only_match is None:
+                title_only_match = track
+
+        if title_only_match is not None:
+            return CheckResult(
+                in_library=True,
+                confidence=95.0,
+                matched_track=title_only_match,
+                reason=f"Exact title match '{title_only_match.title}'",
+            )
+
+        return CheckResult(
+            in_library=False,
+            confidence=0.0,
+            matched_track=None,
+            reason="No exact current-library match — will continue",
+        )
+
     def is_in_library(self, artist: str, title: str) -> CheckResult:
         if not self._tracks:
             return CheckResult(
@@ -235,17 +373,15 @@ class FuzzyLibraryChecker:
             )
 
         norm_title = _normalize(title)
-        norm_title_agg = _normalize_title_aggressive(title)
         norm_artist = _normalize(artist)
 
         best_score = 0.0
-        best_track: Optional[Track] = None
+        best_track: Track | None = None
 
         for track in self._tracks:
-            # Title matching — try both normalisation levels, take the better one
-            ts1 = fuzz.token_set_ratio(norm_title, track.title)
-            ts2 = fuzz.token_set_ratio(norm_title_agg, track.title)
-            title_score = max(ts1, ts2)
+            # Reason: token_set_ratio alone overclaims variant/remix matches because
+            # "song (2019 mix)" vs "song" scores as 100. Keep version info sticky.
+            title_score = _score_title_match(norm_title, track.title)
 
             if norm_artist and track.artist:
                 artist_score = fuzz.token_set_ratio(
