@@ -9,6 +9,7 @@ Inside the repo, prefer running the source tree directly:
 ```bash
 uv run que --help
 uv run que "https://youtube.com/watch?v=..."
+uv run que-menu
 ```
 
 Useful commands:
@@ -19,14 +20,19 @@ UV_CACHE_DIR=/tmp/uv-cache uv run ruff check .
 uv tool install --reinstall .
 uv run que daemon --foreground
 uv run que status
+uv run python -m que.menubar
+uv run --with py2app python scripts/build_menubar_app.py
 ```
 
 Guidelines:
 
 - Use `uv run que ...` while developing so you do not accidentally test a stale installed binary.
+- Use `uv run que-menu` or `uv run python -m que.menubar` for menu-bar development from the repo.
 - Use plain `que ...` only when you want to smoke-test the installed tool.
 - Re-run `./install.sh` or `uv tool install --reinstall .` after CLI changes if you want the global `que` command refreshed.
 - The CLI now auto-starts the daemon on demand, so use `uv run que daemon --foreground` when you want server logs and easier Ctrl-C control.
+- `uv run --with py2app python scripts/build_menubar_app.py` builds `dist/Que Menu.app` without pulling the full dev toolchain into the bundle.
+- Keep the menu-bar refresh timer in both common and `NSEventTrackingRunLoopMode`, otherwise the open dropdown looks frozen until it is reopened.
 
 ## Local Daemon
 
@@ -46,6 +52,7 @@ uv run que "https://youtube.com/watch?v=..."
 uv run que status
 uv run que runs --limit 10
 uv run que daemon stop
+uv run que-menu
 ```
 
 Notes:
@@ -53,6 +60,10 @@ Notes:
 - the daemon owns one active job at a time and queues later submissions FIFO
 - active queue state is intentionally ephemeral; restart drops in-flight work
 - completed history survives because it still lives in SQLite
+- menu-bar config and intake inspection also go through the daemon; avoid duplicating those rules in UI code
+- YouTube watch URLs with `list=` / `index=` context are canonicalized back to a single track; only explicit `/playlist?list=...` URLs expand
+- repeated identical active/queued submissions deduplicate at the daemon instead of creating queue spam
+- harder YouTube metadata lookups may require Chrome cookies even before download starts; retry that in the resolver before treating metadata as a hard failure
 
 ## Benchmark Mode
 
@@ -61,6 +72,7 @@ Notes:
 What benchmark mode skips:
 
 - metadata resolution
+- Chrome-cookie retry after anonymous YouTube anti-bot metadata failures
 - URL cache reads and writes
 - library matching
 - tagging
@@ -161,7 +173,15 @@ When investigating daemon issues:
 
 1. Start with `uv run que daemon --foreground`.
 2. In another shell, submit a job and watch `uv run que status`.
-3. If the daemon looks stuck but `que runs` is still healthy, inspect the active job's last streamed log line.
+3. If a direct CLI run looks stuck, first check whether it is queued behind another daemon job; the CLI now prints the active job's coarse progress while waiting.
+4. If the daemon looks stuck but `que runs` is still healthy, inspect the active job's last streamed log line.
+
+When investigating menu-bar issues:
+
+1. Start with `uv run que daemon --foreground`.
+2. Launch `uv run que-menu` or `uv run python -m que.menubar`.
+3. Right click the menu icon with a supported URL in the clipboard first, then test the Chrome fallback path.
+4. If active-tab fallback fails, check macOS Privacy & Security > Automation for Google Chrome access.
 
 ## Related Docs
 

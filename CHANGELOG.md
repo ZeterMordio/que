@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+- Added Phase 4 `Que Menu.app`: a menu-bar-only AppKit client for quick daemon status, one-click sync, recent-track feedback, and graphical settings.
+- Added daemon-backed config read/write endpoints plus shared intake-inspection endpoints so thin clients can validate input and edit config without reimplementing backend logic.
+- Added menu-bar right-click intake fallback from clipboard to the active Google Chrome tab, with unsupported-source feedback for Spotify and QueUp URLs.
+- Added regression coverage for intake classification, config updates, daemon endpoint round-trips, and menu-bar controller behavior.
+- Updated README, architecture notes, development docs, installer flow, and packaging metadata for the new menu bar app.
+- Fixed stale `in_library` / `downloaded` cache entries so que now revalidates library state, retries Music.app handoff for already-moved files, and no longer reports move-only outcomes as successful imports.
+- Added menu-bar diagnostics logging plus richer live status rows: current stage, current track, progress/ETA, completion notifications, and direct `Open … ↗` Music.app actions for recent imported tracks.
+- Tightened library matching so remix/version titles no longer get mistaken for plain-library tracks, and cache revalidation now requires an exact current-library match before que skips a previously downloaded URL.
+- Fixed YouTube watch URLs with mix/playlist context so `watch?v=...&list=...` stays a single-track job by default, while explicit playlist URLs still expand.
+- Added daemon-side job deduplication plus shared coarse progress snapshot fields so the CLI can show active-job wait status and the menu bar can render progress without duplicating backend event logic.
+- Retried YouTube metadata lookups with Chrome cookies after anonymous anti-bot failures, and surfaced clearer metadata-failure text when YouTube still blocks the lookup.
+- Sanitized the packaged-app `yt-dlp` subprocess environment so `Que Menu.app` no longer leaks py2app Python bootstrap state into Homebrew `yt-dlp` and trips `ModuleNotFoundError: No module named 'optparse'`.
+- Kept the menu-bar refresh timer alive in event-tracking mode so live progress rows continue updating while the dropdown stays open.
+- Stopped treating cached `failed` / `skipped` entries as authoritative future skips; they now remain in history but are retried on the next run.
+- Reworded blank failed history rows in the menu bar so old metadata failures no longer render as misleading `Unknown - Unknown` entries.
+- Polished the menu-bar status surface with phase-aware title glyphs, explicit phase/queue rows, and a pinned `Open Last Finished … ↗` action even while a job is running.
+- Removed the redundant top-level `Idle` / `Running …` row from the dropdown so the first visible line is always the useful live status detail.
+- Reordered active menu rows so the first line shows the current track when known, removed duplicated detail text from the phase row, and simplified the progress summary line.
+- Clarified installer/test guidance: the terminal-run menu app and installed `Que Menu.app` share one single-instance lock and the same daemon, so stale running processes can mask a freshly installed build.
 - Added Phase 3 local daemon support with a Unix-domain-socket HTTP API, FIFO queue state, per-job SSE event streaming, and daemon-backed `que`, `que list`, `que runs`, and `que status` flows.
 - Refactored the core pipeline to emit structured events so the CLI can render daemon-streamed progress without owning the processing logic.
 - Added daemon/client/state regression coverage for queue ordering, SSE delivery, autostart, and CLI proxy behavior.
