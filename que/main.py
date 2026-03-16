@@ -28,6 +28,7 @@ Expansion roadmap (planned)
 from __future__ import annotations
 
 import sys
+import time
 
 from rich.console import Console
 from rich.table import Table
@@ -35,7 +36,7 @@ from rich.table import Table
 from .clipboard import get_urls_from_clipboard, normalize_url, parse_urls
 from .config_cli import cmd_config
 from .service.client import DaemonClient
-from .service.models import JobRequest, ServiceEvent
+from .service.models import JobRequest, JobSnapshot, JobSubmission, ServiceEvent
 from .service.server import serve_forever
 
 console = Console()
@@ -81,6 +82,17 @@ def _format_rate(value: float | None) -> str:
     if value is None:
         return "—"
     return f"{_format_bytes(int(value))}/s"
+
+
+def _format_eta_seconds(value: int | None) -> str:
+    """Render an ETA seconds value for coarse queue-progress output."""
+    if value in (None, 0):
+        return "—"
+    minutes, seconds = divmod(int(value), 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours:d}:{minutes:02d}:{seconds:02d}"
+    return f"{minutes:d}:{seconds:02d}"
 
 
 # ── `que list` subcommand ─────────────────────────────────────────────────────
@@ -281,10 +293,73 @@ def _collect_urls(raw_urls: list[str]) -> list[str]:
     return urls
 
 
-def _stream_job(client: DaemonClient, job_id: str) -> None:
+def _stream_job(
+    client: DaemonClient,
+    job_id: str,
+    *,
+    suppress_lifecycle: bool = False,
+) -> None:
     """Tail a daemon-backed job until the server closes the event stream."""
+    lifecycle_types = {"job_queued", "queue_position_updated", "job_started"}
     for event in client.stream_events(job_id):
+        if suppress_lifecycle and event.type in lifecycle_types:
+            continue
         _render_service_event(event)
+
+
+def _wait_for_job_turn(client: DaemonClient, submission: JobSubmission) -> JobSnapshot:
+    """Keep the CLI attached while a queued job waits behind another job.
+
+    Args:
+        client: Daemon client.
+        submission: Initial submission result.
+
+    Returns:
+        Fresh snapshot once the job starts or finishes while queued.
+    """
+    snapshot = submission.snapshot
+    if snapshot.state != "queued":
+        return snapshot
+
+    printed_signature: tuple[object, ...] | None = None
+    while True:
+        queue = client.get_queue()
+        own = client.get_job(snapshot.job_id)
+        if own.state != "queued":
+            return own
+
+        active = queue["active"]
+        signature = (
+            own.position,
+            active.job_id if active else None,
+            active.phase if active else None,
+            active.detail if active else None,
+            active.processed_count if active else None,
+            active.total_urls if active else None,
+            round(active.progress_fraction, 3) if active else None,
+            active.eta_seconds if active else None,
+        )
+        if signature != printed_signature:
+            printed_signature = signature
+            if active is None:
+                console.print(
+                    "[dim]Queued job "
+                    f"{own.job_id} at position {own.position}; "
+                    "waiting for daemon worker.[/dim]"
+                )
+            else:
+                progress = int((active.progress_fraction or 0.0) * 100)
+                eta = _format_eta_seconds(active.eta_seconds)
+                console.print(
+                    f"[dim]Queued job {own.job_id} at position {own.position}. "
+                    f"Active {active.job_id}: "
+                    f"{active.phase.replace('_', ' ')} — "
+                    f"{active.detail or active.last_message or 'Working'} "
+                    f"({active.processed_count}/{active.total_urls}, {progress}%"
+                    + (f", ETA {eta}" if eta != "—" else "")
+                    + ").[/dim]"
+                )
+        time.sleep(0.5)
 
 
 def _print_error_and_exit(message: str) -> None:
@@ -451,6 +526,7 @@ def main() -> None:
 
     # ── Collect URLs and submit to daemon ────────────────────────────────────
     if args.urls:
+        console.print("[bold]que[/bold] — using URL arguments…")
         urls = _collect_urls(args.urls)
     else:
         console.print("[bold]que[/bold] — reading clipboard…")
@@ -474,8 +550,24 @@ def main() -> None:
     )
     try:
         client = DaemonClient()
-        snapshot = client.submit_job(request)
-        _stream_job(client, snapshot.job_id)
+        submission = client.submit_job(request)
+        snapshot = submission.snapshot
+        if submission.deduplicated:
+            if snapshot.state == "running":
+                console.print(
+                    f"[dim]Attached to existing running job {snapshot.job_id}.[/dim]"
+                )
+            else:
+                console.print(
+                    f"[dim]Attached to existing queued job {snapshot.job_id} "
+                    f"(position {snapshot.position}).[/dim]"
+                )
+        waited_snapshot = _wait_for_job_turn(client, submission)
+        _stream_job(
+            client,
+            waited_snapshot.job_id,
+            suppress_lifecycle=waited_snapshot.state != submission.snapshot.state,
+        )
     except RuntimeError as exc:
         _print_error_and_exit(str(exc))
 

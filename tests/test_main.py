@@ -9,7 +9,7 @@ import pytest
 from rich.console import Console
 
 from que import main
-from que.service.models import JobSnapshot, ServiceEvent
+from que.service.models import JobSnapshot, JobSubmission, ServiceEvent
 
 
 def _summary_payload(*, run_mode: str = "normal") -> dict[str, object]:
@@ -32,6 +32,11 @@ def _summary_payload(*, run_mode: str = "normal") -> dict[str, object]:
     }
 
 
+def _submission(snapshot: JobSnapshot, *, deduplicated: bool = False) -> JobSubmission:
+    """Build a dedupe-aware fake submission payload."""
+    return JobSubmission(snapshot=snapshot, deduplicated=deduplicated)
+
+
 def test_main_submits_job_request_and_streams_events(monkeypatch) -> None:
     """Normal CLI execution should submit a daemon job and tail its events."""
     output = io.StringIO()
@@ -40,7 +45,9 @@ def test_main_submits_job_request_and_streams_events(monkeypatch) -> None:
     class FakeClient:
         def submit_job(self, request):
             calls["request"] = request
-            return JobSnapshot(job_id="job-123", state="queued", position=1, total_urls=1)
+            return _submission(
+                JobSnapshot(job_id="job-123", state="running", position=0, total_urls=1)
+            )
 
         def stream_events(self, job_id):
             calls["job_id"] = job_id
@@ -101,6 +108,7 @@ def test_main_submits_job_request_and_streams_events(monkeypatch) -> None:
     assert calls["job_id"] == "job-123"
 
     rendered = output.getvalue()
+    assert "using URL arguments" in rendered
     assert "queued" in rendered
     assert "que results" in rendered
     assert "downloaded & imported" in rendered
@@ -113,7 +121,9 @@ def test_main_jobs_flag_is_passed_to_job_request(monkeypatch) -> None:
     class FakeClient:
         def submit_job(self, request):
             calls["jobs"] = request.jobs
-            return JobSnapshot(job_id="job-123", state="queued", position=1, total_urls=1)
+            return _submission(
+                JobSnapshot(job_id="job-123", state="running", position=0, total_urls=1)
+            )
 
         def stream_events(self, job_id):
             return iter([ServiceEvent(type="summary", job_id=job_id, payload=_summary_payload())])
@@ -169,7 +179,9 @@ def test_main_benchmark_mode_passes_flag_and_disables_cache(monkeypatch) -> None
         def submit_job(self, request):
             calls["benchmark"] = request.benchmark
             calls["use_cache"] = request.use_cache
-            return JobSnapshot(job_id="job-123", state="queued", position=1, total_urls=1)
+            return _submission(
+                JobSnapshot(job_id="job-123", state="running", position=0, total_urls=1)
+            )
 
         def stream_events(self, job_id):
             return iter(
@@ -319,3 +331,100 @@ def test_main_status_command_renders_active_and_queued_jobs(monkeypatch) -> None
     assert "que status" in rendered
     assert "job-a" in rendered
     assert "job-b" in rendered
+
+
+def test_main_direct_url_path_never_prints_clipboard_banner(monkeypatch) -> None:
+    """Direct URL runs should identify argument input, not claim clipboard usage."""
+    output = io.StringIO()
+
+    class FakeClient:
+        def submit_job(self, request):
+            return _submission(
+                JobSnapshot(job_id="job-123", state="running", position=0, total_urls=1)
+            )
+
+        def stream_events(self, job_id):
+            return iter([ServiceEvent(type="summary", job_id=job_id, payload=_summary_payload())])
+
+    monkeypatch.setattr(
+        main,
+        "console",
+        Console(file=output, force_terminal=False, color_system=None),
+    )
+    monkeypatch.setattr(main, "DaemonClient", lambda *args, **kwargs: FakeClient())
+    monkeypatch.setattr(main, "parse_urls", lambda value: [value])
+    monkeypatch.setattr(main, "normalize_url", lambda value: value)
+    monkeypatch.setattr(main, "get_urls_from_clipboard", lambda: ["https://youtube.com/watch?v=from-clipboard"])
+    monkeypatch.setattr(main.sys, "argv", ["que", "https://youtube.com/watch?v=abc"])
+
+    main.main()
+
+    rendered = output.getvalue()
+    assert "using URL arguments" in rendered
+    assert "reading clipboard" not in rendered
+
+
+def test_main_queued_job_shows_active_job_progress_while_waiting(monkeypatch) -> None:
+    """Queued CLI jobs should show why they are waiting instead of looking frozen."""
+    output = io.StringIO()
+    snapshots = [
+        JobSnapshot(
+            job_id="job-123",
+            state="queued",
+            position=2,
+            total_urls=1,
+        ),
+        JobSnapshot(
+            job_id="job-123",
+            state="running",
+            position=0,
+            total_urls=1,
+        ),
+    ]
+
+    class FakeClient:
+        def submit_job(self, request):
+            return _submission(snapshots[0])
+
+        def get_queue(self):
+            return {
+                "active": JobSnapshot(
+                    job_id="job-active",
+                    state="running",
+                    position=0,
+                    total_urls=663,
+                    processed_count=9,
+                    phase="checking_library",
+                    detail="Smooth - For Good",
+                    progress_fraction=0.14,
+                    eta_seconds=301,
+                ),
+                "queued": [snapshots[0]],
+            }
+
+        def get_job(self, _job_id):
+            return snapshots.pop(0)
+
+        def stream_events(self, job_id):
+            return iter([ServiceEvent(type="summary", job_id=job_id, payload=_summary_payload())])
+
+    monkeypatch.setattr(
+        main,
+        "console",
+        Console(file=output, force_terminal=False, color_system=None),
+    )
+    monkeypatch.setattr(main, "DaemonClient", lambda *args, **kwargs: FakeClient())
+    monkeypatch.setattr(main, "parse_urls", lambda value: [value])
+    monkeypatch.setattr(main, "normalize_url", lambda value: value)
+    monkeypatch.setattr(main, "get_urls_from_clipboard", lambda: [])
+    monkeypatch.setattr(main.time, "sleep", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(main.sys, "argv", ["que", "https://youtube.com/watch?v=abc"])
+
+    main.main()
+
+    rendered = output.getvalue()
+    assert "Queued job job-123 at position 2" in rendered
+    assert "Active job-active" in rendered
+    assert "checking library" in rendered
+    assert "Smooth -" in rendered
+    assert "For Good" in rendered
