@@ -12,8 +12,10 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
+from .. import config as runtime_config
 from ..cache import Cache, RunEntry
-from ..config import load_config
+from ..config import apply_config_update, config_to_dict, load_config, write_config
+from ..intake import inspect_input
 from .models import JobRequest
 from .paths import service_pid_path, service_socket_path, service_state_dir
 from .state import DaemonState
@@ -105,6 +107,10 @@ class _DaemonHTTPHandler(BaseHTTPRequestHandler):
             self._write_json(HTTPStatus.OK, {"rows": rows})
             return
 
+        if parsed.path == "/v1/config":
+            self._write_json(HTTPStatus.OK, _read_active_config())
+            return
+
         self._write_json(HTTPStatus.NOT_FOUND, {"error": "not found"})
 
     def do_POST(self) -> None:
@@ -118,8 +124,9 @@ class _DaemonHTTPHandler(BaseHTTPRequestHandler):
                 self._write_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
                 return
 
-            snapshot = self.state.submit_job(request)
-            self._write_json(HTTPStatus.CREATED, snapshot.to_dict())
+            submission = self.state.submit_job(request)
+            status = HTTPStatus.OK if submission.deduplicated else HTTPStatus.CREATED
+            self._write_json(status, submission.to_dict())
             return
 
         if parsed.path == "/v1/shutdown":
@@ -132,6 +139,36 @@ class _DaemonHTTPHandler(BaseHTTPRequestHandler):
 
             self._write_json(HTTPStatus.ACCEPTED, {"status": "shutting_down"})
             threading.Thread(target=self.server.shutdown, daemon=True).start()
+            return
+
+        if parsed.path == "/v1/intake/inspect":
+            try:
+                body = self._read_json()
+                payload = inspect_input(
+                    text=body.get("text"),
+                    candidates=body.get("candidates"),
+                ).to_dict()
+            except ValueError as exc:
+                self._write_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                return
+
+            self._write_json(HTTPStatus.OK, payload)
+            return
+
+        self._write_json(HTTPStatus.NOT_FOUND, {"error": "not found"})
+
+    def do_PUT(self) -> None:
+        """Handle idempotent daemon update endpoints."""
+        parsed = urlparse(self.path)
+        if parsed.path == "/v1/config":
+            try:
+                body = self._read_json()
+                payload = _write_active_config(body)
+            except ValueError as exc:
+                self._write_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                return
+
+            self._write_json(HTTPStatus.OK, payload)
             return
 
         self._write_json(HTTPStatus.NOT_FOUND, {"error": "not found"})
@@ -239,6 +276,19 @@ def _read_runs(limit: int) -> list[RunEntry]:
         cache.close()
 
 
+def _read_active_config() -> dict[str, Any]:
+    """Return the active config payload for UI clients."""
+    config = load_config()
+    return config_to_dict(config, runtime_config.CONFIG_PATH)
+
+
+def _write_active_config(payload: dict[str, Any]) -> dict[str, Any]:
+    """Validate and persist a config update payload."""
+    config = apply_config_update(payload, base_config=load_config())
+    write_config(config, runtime_config.CONFIG_PATH)
+    return config_to_dict(config, runtime_config.CONFIG_PATH)
+
+
 def _acquire_pid_lock(pid_path: Path):
     """Acquire the daemon PID lock or return None if another daemon owns it."""
     pid_path.parent.mkdir(parents=True, exist_ok=True)
@@ -299,4 +349,3 @@ def serve_forever(
     finally:
         server.server_close()
         lock_handle.close()
-

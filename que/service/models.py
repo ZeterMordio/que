@@ -5,12 +5,45 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from typing import Any
 
+from ..intake import normalize_url
+
 TERMINAL_JOB_STATES = {"completed", "failed"}
 
 
 def _now_iso() -> str:
     """Return the current local timestamp as ISO text."""
     return datetime.now().isoformat()
+
+
+@dataclass(frozen=True)
+class TrackRef:
+    """Small track reference shared across daemon snapshots and clients.
+
+    Attributes:
+        artist: Resolved artist text.
+        title: Resolved title text.
+    """
+
+    artist: str
+    title: str
+
+    def to_dict(self) -> dict[str, str]:
+        """Return a JSON-safe dictionary form."""
+        return {"artist": self.artist, "title": self.title}
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> TrackRef:
+        """Build a track reference from JSON."""
+        return cls(
+            artist=str(data.get("artist") or ""),
+            title=str(data.get("title") or ""),
+        )
+
+    def label(self) -> str:
+        """Return a compact human-readable label."""
+        if self.artist and self.title:
+            return f"{self.artist} - {self.title}"
+        return self.artist or self.title or "Unknown Track"
 
 
 @dataclass
@@ -35,7 +68,7 @@ class JobRequest:
         urls = data.get("urls")
         if not isinstance(urls, list) or not urls:
             raise ValueError("urls must be a non-empty list")
-        normalized_urls = [str(url).strip() for url in urls if str(url).strip()]
+        normalized_urls = [normalize_url(str(url).strip()) for url in urls if str(url).strip()]
         if not normalized_urls:
             raise ValueError("urls must contain at least one non-empty value")
 
@@ -67,10 +100,25 @@ class JobRequest:
 
     def validate(self) -> None:
         """Validate combinations that must match the CLI behavior."""
+        self.urls = [normalize_url(str(url).strip()) for url in self.urls if str(url).strip()]
+        if not self.urls:
+            raise ValueError("urls must contain at least one non-empty value")
         if self.benchmark and self.dry_run:
             raise ValueError("benchmark cannot be combined with dry_run")
         if self.benchmark and self.playlist_name:
             raise ValueError("benchmark cannot be combined with playlist_name")
+
+    def fingerprint(self) -> tuple[Any, ...]:
+        """Return an exact job fingerprint for queue deduplication."""
+        return (
+            tuple(self.urls),
+            self.dry_run,
+            self.benchmark,
+            self.playlist_name,
+            self.jobs,
+            self.threshold_override,
+            self.use_cache,
+        )
 
 
 @dataclass
@@ -95,10 +143,19 @@ class JobSnapshot:
     started_at: str | None = None
     finished_at: str | None = None
     last_message: str | None = None
+    phase: str = "queued"
+    detail: str = "Waiting in queue"
+    current_track: TrackRef | None = None
+    progress_fraction: float = 0.0
+    eta_seconds: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Return a JSON-safe dictionary form."""
-        return asdict(self)
+        payload = asdict(self)
+        payload["current_track"] = (
+            self.current_track.to_dict() if self.current_track is not None else None
+        )
+        return payload
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> JobSnapshot:
@@ -122,6 +179,47 @@ class JobSnapshot:
             started_at=data.get("started_at"),
             finished_at=data.get("finished_at"),
             last_message=data.get("last_message"),
+            phase=str(data.get("phase", "queued")),
+            detail=str(data.get("detail") or ""),
+            current_track=(
+                TrackRef.from_dict(data["current_track"])
+                if isinstance(data.get("current_track"), dict)
+                else None
+            ),
+            progress_fraction=float(data.get("progress_fraction", 0.0) or 0.0),
+            eta_seconds=(
+                int(data["eta_seconds"])
+                if data.get("eta_seconds") not in (None, "")
+                else None
+            ),
+        )
+
+
+@dataclass(frozen=True)
+class JobSubmission:
+    """Result of one daemon job submission attempt.
+
+    Attributes:
+        snapshot: Active or queued job snapshot returned by the daemon.
+        deduplicated: True when the daemon reused an existing queued/running job.
+    """
+
+    snapshot: JobSnapshot
+    deduplicated: bool = False
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a JSON-safe dictionary form."""
+        return {
+            "job": self.snapshot.to_dict(),
+            "deduplicated": self.deduplicated,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> JobSubmission:
+        """Build a submission result from JSON."""
+        return cls(
+            snapshot=JobSnapshot.from_dict(dict(data["job"])),
+            deduplicated=bool(data.get("deduplicated", False)),
         )
 
 

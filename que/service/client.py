@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from ..cache import RunEntry
-from .models import JobRequest, JobSnapshot, ServiceEvent
+from .models import JobRequest, JobSnapshot, JobSubmission, ServiceEvent
 from .paths import service_socket_path
 
 
@@ -49,16 +49,16 @@ class DaemonClient:
         """Return the daemon health payload."""
         return self._request_json("GET", "/v1/health", autostart=self.autostart)
 
-    def submit_job(self, request: JobRequest) -> JobSnapshot:
+    def submit_job(self, request: JobRequest) -> JobSubmission:
         """Submit a new job to the daemon."""
         payload = self._request_json(
             "POST",
             "/v1/jobs",
             body=request.to_dict(),
-            expected_statuses={201},
+            expected_statuses={200, 201},
             autostart=self.autostart,
         )
-        return JobSnapshot.from_dict(payload)
+        return JobSubmission.from_dict(payload)
 
     def get_job(self, job_id: str) -> JobSnapshot:
         """Fetch a single job snapshot."""
@@ -119,15 +119,50 @@ class DaemonClient:
             for row in payload["rows"]
         ]
 
-    def stop(self) -> dict[str, Any]:
-        """Request a clean idle shutdown from the daemon."""
+    def get_config(self) -> dict[str, Any]:
+        """Fetch the active daemon-backed config payload."""
+        return self._request_json("GET", "/v1/config", autostart=self.autostart)
+
+    def update_config(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Persist a config update through the daemon."""
+        return self._request_json(
+            "PUT",
+            "/v1/config",
+            body=payload,
+            autostart=self.autostart,
+        )
+
+    def inspect_input(
+        self,
+        *,
+        text: str | None = None,
+        candidates: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Inspect intake text or explicit URLs through the daemon."""
         return self._request_json(
             "POST",
-            "/v1/shutdown",
-            body={},
-            expected_statuses={202},
-            autostart=False,
+            "/v1/intake/inspect",
+            body={"text": text, "candidates": candidates},
+            autostart=self.autostart,
         )
+
+    def stop(self) -> dict[str, Any]:
+        """Request a clean idle shutdown from the daemon."""
+        try:
+            return self._request_json(
+                "POST",
+                "/v1/shutdown",
+                body={},
+                expected_statuses={202},
+                autostart=False,
+            )
+        except RuntimeError as exc:
+            if str(exc) != "que daemon socket not found":
+                raise
+            # Reason: shutdown can win the race and remove the Unix socket
+            # before the client reads the HTTP response. Missing socket here
+            # still means the daemon stopped successfully.
+            return {"status": "shutting_down"}
 
     def stream_events(self, job_id: str) -> Iterator[ServiceEvent]:
         """Yield SSE events for one job."""
@@ -174,7 +209,6 @@ class DaemonClient:
         if autostart:
             self._ensure_running()
 
-        connection = _UnixHTTPConnection(self.socket_path, timeout=self.startup_timeout_seconds)
         encoded_body = None
         headers = {}
         if body is not None:
@@ -182,16 +216,30 @@ class DaemonClient:
             headers["Content-Type"] = "application/json"
             headers["Content-Length"] = str(len(encoded_body))
 
-        try:
-            connection.request(method, path, body=encoded_body, headers=headers)
-            response = connection.getresponse()
-            raw = response.read().decode("utf-8")
-        except FileNotFoundError as exc:
-            raise RuntimeError("que daemon socket not found") from exc
-        except OSError as exc:
-            raise RuntimeError("que daemon socket is not ready") from exc
-        finally:
-            connection.close()
+        response = None
+        raw = ""
+        for attempt in range(2):
+            connection = _UnixHTTPConnection(
+                self.socket_path,
+                timeout=self.startup_timeout_seconds,
+            )
+            try:
+                connection.request(method, path, body=encoded_body, headers=headers)
+                response = connection.getresponse()
+                raw = response.read().decode("utf-8")
+                break
+            except FileNotFoundError as exc:
+                raise RuntimeError("que daemon socket not found") from exc
+            except OSError as exc:
+                if attempt == 0:
+                    time.sleep(0.05)
+                    continue
+                raise RuntimeError("que daemon socket is not ready") from exc
+            finally:
+                connection.close()
+
+        if response is None:
+            raise RuntimeError("que daemon socket is not ready")
 
         payload = json.loads(raw or "{}")
         expected_statuses = expected_statuses or {200}

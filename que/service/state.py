@@ -9,7 +9,8 @@ from datetime import datetime
 from typing import Any
 
 from .executor import execute_job
-from .models import TERMINAL_JOB_STATES, JobRequest, JobSnapshot, ServiceEvent
+from .models import TERMINAL_JOB_STATES, JobRequest, JobSnapshot, JobSubmission, ServiceEvent
+from .progress import initialize_snapshot_progress, project_pipeline_event
 
 
 class _JobRuntime:
@@ -32,20 +33,33 @@ class DaemonState:
         self._active_job_id: str | None = None
         self._max_completed_jobs = max_completed_jobs
 
-    def submit_job(self, request: JobRequest) -> JobSnapshot:
-        """Queue a new job and return its first snapshot."""
+    def submit_job(self, request: JobRequest) -> JobSubmission:
+        """Queue a new job or reuse an identical active/queued job.
+
+        Args:
+            request: Canonical daemon-backed job request.
+
+        Returns:
+            Submission result containing the job snapshot plus dedupe metadata.
+        """
         request.validate()
-        job_id = uuid.uuid4().hex[:12]
-        snapshot = JobSnapshot(
-            job_id=job_id,
-            state="queued",
-            position=0,
-            total_urls=len(request.urls),
-            run_mode="benchmark" if request.benchmark else "normal",
-        )
-        runtime = _JobRuntime(request=request, snapshot=snapshot)
+        fingerprint = request.fingerprint()
 
         with self._lock:
+            existing = self._find_duplicate_job_locked(fingerprint)
+            if existing is not None:
+                return JobSubmission(snapshot=replace(existing.snapshot), deduplicated=True)
+
+            job_id = uuid.uuid4().hex[:12]
+            snapshot = JobSnapshot(
+                job_id=job_id,
+                state="queued",
+                position=0,
+                total_urls=len(request.urls),
+                run_mode="benchmark" if request.benchmark else "normal",
+            )
+            initialize_snapshot_progress(snapshot)
+            runtime = _JobRuntime(request=request, snapshot=snapshot)
             self._jobs[job_id] = runtime
             self._queue.append(job_id)
             self._recompute_positions_locked()
@@ -59,7 +73,7 @@ class DaemonState:
                 ),
             )
             self._maybe_start_next_locked()
-            return replace(runtime.snapshot)
+            return JobSubmission(snapshot=replace(runtime.snapshot), deduplicated=False)
 
     def get_job(self, job_id: str) -> JobSnapshot | None:
         """Return the current snapshot for a job."""
@@ -120,6 +134,7 @@ class DaemonState:
             runtime = self._jobs[job_id]
             if runtime.snapshot.state != "queued":
                 continue
+            initialize_snapshot_progress(runtime.snapshot)
             if runtime.snapshot.position == position:
                 continue
             runtime.snapshot.position = position
@@ -143,6 +158,9 @@ class DaemonState:
         runtime.snapshot.state = "running"
         runtime.snapshot.position = 0
         runtime.snapshot.started_at = datetime.now().isoformat()
+        runtime.snapshot.detail = "Starting job"
+        runtime.snapshot.phase = "preflight"
+        initialize_snapshot_progress(runtime.snapshot)
         self._append_event_locked(
             runtime,
             ServiceEvent(
@@ -201,6 +219,12 @@ class DaemonState:
                 runtime.snapshot.finished_at = (
                     runtime.snapshot.finished_at or datetime.now().isoformat()
                 )
+                project_pipeline_event(
+                    runtime.snapshot,
+                    event_type="job_failed",
+                    message=f"Job failed: {exc}",
+                    payload={"error": str(exc)},
+                )
                 self._append_event_locked(
                     runtime,
                     ServiceEvent(
@@ -255,6 +279,13 @@ class DaemonState:
                 snapshot.run_id = payload.get("run_id")
                 snapshot.finished_at = payload.get("finished_at", snapshot.finished_at)
 
+            project_pipeline_event(
+                snapshot,
+                event_type=event_type,
+                message=message,
+                payload=payload,
+            )
+
             self._append_event_locked(
                 runtime,
                 ServiceEvent(
@@ -283,3 +314,22 @@ class DaemonState:
             if job_id == self._active_job_id or job_id in self._queue:
                 continue
             self._jobs.pop(job_id, None)
+
+    def _find_duplicate_job_locked(
+        self,
+        fingerprint: tuple[Any, ...],
+    ) -> _JobRuntime | None:
+        """Return a matching active or queued runtime for exact dedupe checks."""
+        active_and_queued = list(self._queue)
+        if self._active_job_id and self._active_job_id not in active_and_queued:
+            active_and_queued.insert(0, self._active_job_id)
+
+        for job_id in active_and_queued:
+            runtime = self._jobs.get(job_id)
+            if runtime is None:
+                continue
+            if runtime.snapshot.state not in {"queued", "running"}:
+                continue
+            if runtime.request.fingerprint() == fingerprint:
+                return runtime
+        return None

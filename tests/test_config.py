@@ -212,3 +212,87 @@ destination = "~/Music/Library"
     loaded = config.load_config()
 
     assert loaded.import_mode == "move_then_music"
+
+
+def test_apply_config_update_merges_partial_payload(tmp_path) -> None:
+    """Partial config updates should merge onto the existing runtime config."""
+    base = config.default_config()
+    updated = config.apply_config_update(
+        {
+            "use_music_app": False,
+            "fuzzy_threshold": 72,
+            "staging_dir": str(tmp_path / "staging"),
+            "import_destination": str(tmp_path / "library"),
+        },
+        base_config=base,
+    )
+
+    assert updated.use_music_app is False
+    assert updated.fuzzy_threshold == 72
+    assert updated.staging_dir == tmp_path / "staging"
+    assert updated.import_destination == tmp_path / "library"
+    assert updated.cache_path == base.cache_path
+
+
+def test_apply_config_update_rejects_invalid_threshold() -> None:
+    """Config updates should validate the fuzzy threshold range."""
+    try:
+        config.apply_config_update({"fuzzy_threshold": 120}, base_config=config.default_config())
+    except ValueError as exc:
+        assert "fuzzy_threshold" in str(exc)
+    else:
+        raise AssertionError("expected ValueError")
+
+
+def test_config_to_dict_includes_config_path(tmp_path) -> None:
+    """Serialized config payloads should include the backing config path."""
+    payload = config.config_to_dict(config.default_config(), tmp_path / "config.toml")
+
+    assert payload["config_path"] == str(tmp_path / "config.toml")
+    assert payload["audio_format"] == "m4a"
+
+
+def test_write_config_preserves_unknown_sections_and_keys(tmp_path) -> None:
+    """Config writes should not delete raw TOML fields outside the typed model."""
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        """
+[library]
+paths = ["~/Music/Custom"]
+fuzzy_threshold = 80
+custom_match_mode = "album"
+
+[download]
+staging_dir = "~/Downloads/old"
+format = "mp3"
+retries = 4
+
+[import]
+use_music_app = true
+mode = "move_then_music"
+destination = "~/Music/Library"
+
+[cache]
+path = "~/Library/Caches/que.db"
+
+[menubar]
+quick_sync_playlist = "Road Trip"
+""".strip(),
+        encoding="utf-8",
+    )
+
+    updated = config.apply_config_update(
+        {
+            "fuzzy_threshold": 72,
+            "staging_dir": str(tmp_path / "staging"),
+        },
+        base_config=config.load_config(config_path),
+    )
+    config.write_config(updated, config_path)
+    written = config_path.read_text(encoding="utf-8")
+
+    assert 'custom_match_mode = "album"' in written
+    assert "retries = 4" in written
+    assert "[menubar]" in written
+    assert 'quick_sync_playlist = "Road Trip"' in written
+    assert "fuzzy_threshold = 72" in written

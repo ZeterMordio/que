@@ -6,8 +6,9 @@ from typing import Any
 
 from ..cache import Cache, _NullCache
 from ..config import load_config
+from ..intake import target_from_url
 from ..pipeline import ProcessResult, process_urls
-from ..resolver import expand_playlist, is_playlist_url
+from ..resolver import expand_playlist
 from .models import JobRequest
 
 EventHandler = Callable[[str, str | None, dict[str, Any]], None]
@@ -28,20 +29,21 @@ def _emit(
 def _expand_urls(request: JobRequest, event_handler: EventHandler | None) -> list[str]:
     """Expand playlist URLs into per-track URLs for the pipeline."""
     expanded: list[str] = []
-    for url in request.urls:
-        if is_playlist_url(url):
-            _emit(event_handler, "log", "  Expanding playlist…", url=url)
-            tracks = expand_playlist(url)
+    for raw_url in request.urls:
+        target = target_from_url(raw_url)
+        if target.kind == "playlist":
+            _emit(event_handler, "log", "  Expanding playlist…", url=target.normalized_url)
+            tracks = expand_playlist(target.normalized_url)
             expanded.extend(tracks)
             _emit(
                 event_handler,
                 "playlist_expanded",
                 f"  📋 Playlist expanded → [bold]{len(tracks)}[/bold] tracks",
-                url=url,
+                url=target.normalized_url,
                 expanded_count=len(tracks),
             )
             continue
-        expanded.append(url)
+        expanded.append(target.normalized_url)
 
     _emit(
         event_handler,
