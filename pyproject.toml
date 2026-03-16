@@ -11,10 +11,12 @@ dependencies = [
     "rapidfuzz>=3.0",
     "mutagen>=1.47",
     "rich>=13.0",
+    "pyobjc-framework-Cocoa>=11.1; platform_system == 'Darwin'",
 ]
 
 [project.scripts]
 que = "que.main:main"
+que-menu = "que.menubar.app:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
@@ -24,6 +26,7 @@ include = ["que*"]
 dev = [
     "ruff>=0.9",
     "pytest>=8.0",
+    "py2app>=0.28; platform_system == 'Darwin'",
 ]
 
 [tool.ruff]

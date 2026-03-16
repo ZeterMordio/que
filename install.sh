@@ -23,6 +23,16 @@ fi
 echo "==> Installing que..."
 uv tool install --reinstall "$SCRIPT_DIR"
 
+echo "==> Building Que Menu.app..."
+(
+    cd "$SCRIPT_DIR"
+    uv run --with py2app python scripts/build_menubar_app.py >/dev/null
+)
+
+echo "==> Installing Que Menu.app..."
+mkdir -p "$HOME/Applications"
+ditto "$SCRIPT_DIR/dist/Que Menu.app" "$HOME/Applications/Que Menu.app"
+
 echo ""
 echo "✓ que installed successfully."
 echo ""
@@ -31,7 +41,16 @@ echo "  que                    — read clipboard and sync playlist"
 echo "  que <URL>              — process a single URL"
 echo "  que --dry-run          — preview without downloading"
 echo "  que list               — show history"
+echo "  que-menu               — run the menu bar app from a terminal"
 echo "  que --help             — full help"
 echo ""
 echo "Config: ~/.config/que/config.toml (created on first run with defaults)"
 echo "Cache:  ~/.local/share/que/cache.db"
+echo "App:    ~/Applications/Que Menu.app"
+echo ""
+echo "Note:"
+echo "  - Quit any already-running menu-bar instance before testing the installed app."
+echo "    The terminal-run and packaged app share one single-instance lock."
+echo "  - Restart the local daemon after backend updates if you want the installed app"
+echo "    to pick up new service behavior immediately:"
+echo "      que daemon stop"
