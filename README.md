@@ -1,14 +1,14 @@
 # que
 
-`que` is a macOS CLI and menu bar app for bringing YouTube tracks and playlists into Apple Music without redownloading songs you already have.
+`que` is a macOS menu bar app and CLI for bringing YouTube tracks and playlists into Apple Music without redownloading songs you already have.
 
-Copy a URL, run one command, and let `que` check your library, download only the missing tracks, tag them, and hand them off to Apple Music.
+For most people, `Que Menu.app` is the easiest way to use it: left click for status, history, and settings, right click to quickly download and sync from anywhere. The CLI is still there when you want direct control.
 
 ## What It Does
 
-- Accepts a YouTube track or playlist URL from the clipboard or the command line
-- Auto-starts a local daemon so queue state, history, and live progress have one source of truth
-- Ships a lightweight menu bar client for quick status, one-click sync, and graphical settings
+- Ships `Que Menu.app` so you can left click for status/history/settings or right click to download and sync
+- Accepts a YouTube track or playlist URL from the clipboard, an active Chrome tab, or the command line
+- Auto-starts a local daemon so the menu bar app and CLI share one source of truth for queue state, history, and live progress
 - Checks your local library before downloading, so obvious duplicates are skipped
 - Downloads missing tracks, tags them, and imports them into Apple Music
 - Can add newly imported tracks to a named Apple Music playlist
@@ -22,8 +22,7 @@ Copy a URL, run one command, and let `que` check your library, download only the
 
 Optional but useful:
 
-- Google Chrome, for occasional `yt-dlp` cookie fallback on harder-to-download videos
-- Google Chrome, for the menu bar app's active-tab fallback on right click
+- Google Chrome, for the menu bar app's active-tab fallback on right click and occasional `yt-dlp` cookie fallback on harder-to-download videos
 
 ## Install
 
@@ -41,18 +40,22 @@ chmod +x install.sh
 que config
 ```
 
-That is usually enough. The install script handles `uv`, `yt-dlp`, and `Que Menu.app` for you.
+That is usually enough. The install script handles `uv`, `yt-dlp`, `que`, and `Que Menu.app` for you. Most users can launch the menu bar app right away and start from there.
 
 ## Quickstart
 
-1. Copy a YouTube track or playlist URL.
-2. Run:
+1. Launch `Que Menu.app` from `~/Applications`.
+2. Copy a YouTube track or playlist URL, or leave Chrome frontmost on one.
+3. Right click the menu bar icon to start a sync immediately.
+4. Left click any time to watch status, open the latest imported track, or change settings.
+
+If you prefer the CLI, the fastest path is still:
 
 ```bash
 que
 ```
 
-3. `que` reads the clipboard, checks your library, downloads missing tracks, and imports them into Apple Music.
+`que` reads the clipboard, checks your library, downloads missing tracks, and imports them into Apple Music.
 
 If you prefer not to use the clipboard, pass the URL directly:
 
@@ -67,41 +70,39 @@ Important YouTube behavior:
 
 ## Everyday Usage
 
+Most people will use the menu bar app day to day:
+
 ```bash
-que                              # From clipboard
-que <URL>                        # Direct URL
-que --playlist "Blues" <URL>     # Add imported tracks to a playlist directly
-que --dry-run <URL>              # Preview download first
-que config                       # Start config wizard for help 🧙
-que-menu                         # Launch the menu bar app from a terminal
+open ~/Applications/Que\ Menu.app
+```
+
+Right click to download and sync right away. Left click for status, history, `Open Last Finished … ↗`, and `Settings…`.
+
+Use the CLI when you want direct control:
+
+```bash
+que                          # From clipboard
+que <URL>                    # Direct URL
+que --playlist "Blues" <URL> # Add imported tracks to a playlist directly
+que --dry-run <URL>          # Preview download first
+que config                   # Terminal config helper
+que-menu                     # Launch the menu bar app from a terminal
 ```
 
 ## Menu Bar App
 
-`Que Menu.app` is a thin client on top of the same local daemon used by the CLI.
+`Que Menu.app` is the default interface. It uses the same queue, history, and config as the CLI.
 
-- Left click opens the dropdown for status, recent tracks, quick sync, and `Settings…`
-- Right click immediately runs the default intake flow without opening the menu
+- Left click for status, recent tracks, settings, and `Open Last Finished … ↗`
+- Right click to start the default sync flow without opening the menu
 - If the clipboard has no actionable URL and Google Chrome is frontmost, right click falls back to the active tab URL
-- While a job is active, the menu-bar title itself now reflects the live phase, and the dropdown puts the current track first, followed by phase, progress, queue, and ETA
-- The live rows keep refreshing while the dropdown stays open, so you do not need to close and reopen the menu to watch progress
-- Recent-history rows now use descriptive fallback wording when an old failed attempt never resolved track metadata
-- The newest imported/library track stays pinned as `Open Last Finished … ↗` so you can jump straight into Music.app
-- The app writes lightweight diagnostics to `~/.local/state/que/menubar.log` so intermittent UI issues can usually be debugged without driving the UI directly
+- Active jobs stay live in the open dropdown, including current track, phase, progress, queue, and ETA
+- Diagnostics log: `~/.local/state/que/menubar.log`
 
 Current menu-bar intake behavior:
 
 - actionable today: YouTube, SoundCloud
 - recognized but rejected for now: Spotify, QueUp
-
-Important macOS note:
-
-- Chrome tab fallback needs macOS Automation approval the first time `Que Menu.app` asks Chrome for the active tab URL
-- If that access is denied, the app stays usable and shows feedback instead of submitting a job
-- If a prior run moved a file into your library folder but Music.app missed it, later runs now retry the Music.app handoff before redownloading
-- Harder YouTube videos may need Chrome cookies for metadata lookup too; que now retries that path automatically before giving up
-- The packaged `Que Menu.app` now scrubs py2app Python bootstrap env before running `yt-dlp`, so the installed app and terminal app share the same metadata/download behavior
-- `uv run que-menu` and `~/Applications/Que Menu.app` share one single-instance lock and the same local daemon, so quit the currently running menu app and restart the daemon after backend changes when you want to test a freshly installed build
 
 ## Power Usage
 
@@ -181,6 +182,15 @@ The menu bar app also uses the daemon for:
 - Cache DB: `~/.local/share/que/cache.db`
 - Daemon socket: `~/.local/state/que/daemon.sock`
 - Daemon PID lock: `~/.local/state/que/daemon.pid`
+
+macOS notes:
+
+- Chrome tab fallback needs macOS Automation approval the first time `Que Menu.app` asks Chrome for the active tab URL
+- If that access is denied, the app stays usable and shows feedback instead of submitting a job
+- If a prior run moved a file into your library folder but Apple Music missed it, later runs now retry the Apple Music handoff before redownloading
+- Harder YouTube videos may need Chrome cookies for metadata lookup too; `que` now retries that path automatically before giving up
+- The packaged `Que Menu.app` now scrubs py2app Python bootstrap env before running `yt-dlp`, so the installed app and terminal app share the same metadata/download behavior
+- `uv run que-menu` and `~/Applications/Que Menu.app` share one single-instance lock and the same local daemon, so quit the currently running menu app and restart the daemon after backend changes when you want to test a freshly installed build
 
 ## Future Enhancements
 
